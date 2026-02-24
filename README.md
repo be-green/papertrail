@@ -134,6 +134,16 @@ This runs the full pipeline: find, download, convert to markdown, generate a str
 | `PAPERTRAIL_DATA_DIR` | `~/.papertrail` | Local data directory |
 | `PAPERTRAIL_RCLONE_REMOTE` | (empty) | rclone remote path (e.g., `wasabi:bucket/papertrail`) |
 | `PAPERTRAIL_SEMANTIC_SCHOLAR_API_KEY` | (none) | Optional API key for higher rate limits |
+| `PAPERTRAIL_HTTP_PROXY` | (none) | HTTP proxy for PDF downloads (e.g., institutional proxy for off-VPN access) |
+| `PAPERTRAIL_UNPAYWALL_EMAIL` | (none) | Email for Unpaywall API (finds legal open access PDFs, no key needed) |
+
+### Accessing paywalled papers
+
+If you have institutional access (e.g., MIT, Stanford, etc.):
+
+- **On VPN**: PDF downloads through DOI links work automatically -- publishers see your institutional IP.
+- **Off VPN**: Set `PAPERTRAIL_HTTP_PROXY` to your institution's proxy URL to route PDF downloads through it.
+- **Unpaywall**: Set `PAPERTRAIL_UNPAYWALL_EMAIL` to any email address to enable the Unpaywall API, which finds legal open access copies of papers (preprints, author copies, green OA). No API key needed.
 
 ## Data storage
 

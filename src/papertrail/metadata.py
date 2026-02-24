@@ -11,7 +11,7 @@ from papertrail.models import SearchResult
 logger = logging.getLogger(__name__)
 
 SEMANTIC_SCHOLAR_BASE = "https://api.semanticscholar.org/graph/v1"
-ARXIV_API_BASE = "http://export.arxiv.org/api/query"
+ARXIV_API_BASE = "https://export.arxiv.org/api/query"
 ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom"}
 
 SEMANTIC_SCHOLAR_FIELDS = (
@@ -28,13 +28,20 @@ ARXIV_ID_PATTERN = re.compile(r"^(\d{4}\.\d{4,5})(v\d+)?$")
 DOI_PATTERN = re.compile(r"^10\.\d{4,}")
 
 
+UNPAYWALL_BASE = "https://api.unpaywall.org/v2"
+
+
 class MetadataFetcher:
     def __init__(self, config: PapertrailConfig):
         self.api_key = config.semantic_scholar_api_key
+        self.unpaywall_email = config.unpaywall_email
         headers = {}
         if self.api_key:
             headers["x-api-key"] = self.api_key
-        self.client = httpx.AsyncClient(timeout=30.0, headers=headers)
+        proxy = config.http_proxy or None
+        self.client = httpx.AsyncClient(
+            timeout=30.0, headers=headers, follow_redirects=True, proxy=proxy
+        )
 
     async def search(self, query: str, limit: int = 10) -> list[SearchResult]:
         """Search Semantic Scholar and arXiv, merge and deduplicate results."""
@@ -125,7 +132,16 @@ class MetadataFetcher:
         return key
 
     async def download_pdf(self, result: SearchResult, dest_path: Path) -> Path:
-        """Download the PDF for a paper, trying multiple sources."""
+        """Download the PDF for a paper, trying multiple sources.
+
+        Order of attempts:
+        1. Open access PDF URL (from Semantic Scholar)
+        2. arXiv PDF
+        3. SSRN direct download
+        4. Unpaywall (finds legal open access copies)
+        5. DOI redirect (works through institutional VPN/proxy)
+        6. Direct URL
+        """
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         urls_to_try = []
 
@@ -139,6 +155,13 @@ class MetadataFetcher:
         if result.ssrn_id:
             urls_to_try.append(f"https://papers.ssrn.com/sol3/Delivery.cfm?abstractid={result.ssrn_id}")
 
+        # Try Unpaywall for a legal open access PDF
+        if result.doi:
+            unpaywall_url = await self._get_unpaywall_pdf_url(result.doi)
+            if unpaywall_url:
+                urls_to_try.append(unpaywall_url)
+
+        # DOI redirect — works through institutional VPN/proxy
         if result.doi:
             urls_to_try.append(f"https://doi.org/{result.doi}")
 
@@ -148,7 +171,7 @@ class MetadataFetcher:
         last_error = None
         for url in urls_to_try:
             try:
-                response = await self.client.get(url, follow_redirects=True)
+                response = await self.client.get(url)
                 content_type = response.headers.get("content-type", "")
                 if response.status_code == 200 and (
                     "pdf" in content_type or response.content[:5] == b"%PDF-"
@@ -161,6 +184,29 @@ class MetadataFetcher:
                 continue
 
         raise RuntimeError(f"Could not download PDF from any source. Last error: {last_error}")
+
+    async def _get_unpaywall_pdf_url(self, doi: str) -> str | None:
+        """Query Unpaywall for an open access PDF URL."""
+        if not self.unpaywall_email:
+            return None
+        try:
+            response = await self.client.get(
+                f"{UNPAYWALL_BASE}/{doi}",
+                params={"email": self.unpaywall_email},
+            )
+            if response.status_code != 200:
+                return None
+            data = response.json()
+            best_oa = data.get("best_oa_location")
+            if best_oa and best_oa.get("url_for_pdf"):
+                return best_oa["url_for_pdf"]
+            # Check all OA locations
+            for loc in data.get("oa_locations", []):
+                if loc.get("url_for_pdf"):
+                    return loc["url_for_pdf"]
+            return None
+        except (httpx.HTTPError, KeyError):
+            return None
 
     async def close(self) -> None:
         await self.client.aclose()

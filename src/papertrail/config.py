@@ -14,6 +14,12 @@ class PapertrailConfig:
     semantic_scholar_api_key: str | None = field(default_factory=lambda: os.environ.get(
         "PAPERTRAIL_SEMANTIC_SCHOLAR_API_KEY"
     ))
+    http_proxy: str | None = field(default_factory=lambda: os.environ.get(
+        "PAPERTRAIL_HTTP_PROXY"
+    ))
+    unpaywall_email: str | None = field(default_factory=lambda: os.environ.get(
+        "PAPERTRAIL_UNPAYWALL_EMAIL"
+    ))
 
     @classmethod
     def from_env(cls) -> "PapertrailConfig":

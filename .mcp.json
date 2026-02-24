@@ -10,7 +10,8 @@
       ],
       "env": {
         "PAPERTRAIL_DATA_DIR": "${HOME}/.papertrail",
-        "PAPERTRAIL_RCLONE_REMOTE": ""
+        "PAPERTRAIL_RCLONE_REMOTE": "wasabi:bcg-papertrail/",
+        "PAPERTRAIL_UNPAYWALL_EMAIL": ""
       }
     }
   }
