@@ -115,6 +115,7 @@ This runs the full pipeline: find, download, convert to markdown, generate a str
 |------|---------|
 | `find_paper` | Search Semantic Scholar/arXiv for papers |
 | `ingest_paper` | Download and start converting a paper |
+| `ingest_paper_manual` | Register a manually downloaded PDF for a paper |
 | `conversion_status` | Check PDF-to-markdown conversion progress |
 | `read_paper` | Read paper markdown (full or line range) |
 | `store_summary` | Store a generated summary |

@@ -7,7 +7,7 @@ from papertrail.models import PaperMetadata
 
 @pytest_asyncio.fixture
 async def db(tmp_path):
-    database = PaperDatabase(tmp_path / "test.db")
+    database = PaperDatabase(tmp_path / "index.db")
     await database.initialize()
     yield database
     await database.close()
@@ -26,6 +26,7 @@ def _make_paper(**overrides) -> PaperMetadata:
         ssrn_id=None,
         url="https://example.com/paper",
         topics=["causal inference", "economics"],
+        tags=[],
         keywords=["instrumental variables", "regression discontinuity"],
         fields_of_study=["Economics"],
         citation_count=42,
@@ -39,8 +40,6 @@ def _make_paper(**overrides) -> PaperMetadata:
 
 @pytest.mark.asyncio
 async def test_initialize_creates_tables(db):
-    # Verify tables exist by exercising them (no direct connection access
-    # since sqlite3 enforces thread affinity)
     papers = await db.list_papers()
     assert papers == []
     tags = await db.list_tags()
@@ -191,3 +190,50 @@ async def test_check_bibtex_key_exists(db):
     assert not await db.check_bibtex_key_exists("smith_2024_causal")
     await db.upsert_paper(_make_paper())
     assert await db.check_bibtex_key_exists("smith_2024_causal")
+
+
+@pytest.mark.asyncio
+async def test_rebuild_from_papers(db):
+    papers = [
+        _make_paper(bibtex_key="a_2024_one", tags=["macro"]),
+        _make_paper(bibtex_key="b_2024_two", tags=["macro", "finance"]),
+    ]
+    tags = [
+        {"tag": "macro", "description": "Macroeconomics"},
+        {"tag": "finance", "description": "Finance"},
+    ]
+    await db.rebuild_from_papers(papers, tags)
+
+    listed = await db.list_papers()
+    assert len(listed) == 2
+
+    all_tags = await db.list_tags()
+    macro_tag = next(t for t in all_tags if t.tag == "macro")
+    assert macro_tag.paper_count == 2
+    finance_tag = next(t for t in all_tags if t.tag == "finance")
+    assert finance_tag.paper_count == 1
+
+    a_tags = await db.get_paper_tags("a_2024_one")
+    assert a_tags == ["macro"]
+    b_tags = await db.get_paper_tags("b_2024_two")
+    assert b_tags == ["finance", "macro"]
+
+
+@pytest.mark.asyncio
+async def test_rebuild_fulltext(db):
+    await db.upsert_paper(_make_paper(bibtex_key="a_2024_one"))
+    await db.upsert_paper(_make_paper(bibtex_key="b_2024_two"))
+
+    paper_texts = [
+        ("a_2024_one", "This paper discusses instrumental variables."),
+        ("b_2024_two", "We study climate risk and carbon pricing."),
+    ]
+    await db.rebuild_fulltext(paper_texts)
+
+    results = await db.search_fulltext("instrumental variables")
+    assert len(results) == 1
+    assert results[0]["bibtex_key"] == "a_2024_one"
+
+    results = await db.search_fulltext("carbon pricing")
+    assert len(results) == 1
+    assert results[0]["bibtex_key"] == "b_2024_two"

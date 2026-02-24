@@ -7,7 +7,7 @@ from papertrail.models import SearchResult
 
 @pytest.fixture
 def fetcher():
-    config = PapertrailConfig(rclone_remote="")
+    config = PapertrailConfig()
     return MetadataFetcher(config)
 
 

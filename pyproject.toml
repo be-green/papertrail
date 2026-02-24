@@ -9,6 +9,7 @@ dependencies = [
     "pymupdf",
     "httpx",
     "pydantic",
+    "curl_cffi",
 ]
 
 [project.scripts]

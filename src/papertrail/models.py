@@ -31,6 +31,7 @@ class PaperMetadata(BaseModel):
     ssrn_id: str | None = None
     url: str | None = None
     topics: list[str] = []
+    tags: list[str] = []
     keywords: list[str] = []
     fields_of_study: list[str] = []
     citation_count: int | None = None

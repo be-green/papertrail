@@ -4,10 +4,25 @@ MCP server for managing an academic paper library.
 
 ## Architecture
 - MCP server at src/papertrail/server.py using FastMCP
-- SQLite with FTS5 for search (database.py)
-- rclone for syncing to Wasabi (storage.py)
+- JSON files per paper are the source of truth (on rclone mount at ~/.papertrail)
+- SQLite FTS5 index is ephemeral, rebuilt on startup from JSON (database.py)
+- PaperStore handles JSON file I/O on the mounted filesystem (paper_store.py)
 - Semantic Scholar + arXiv + SSRN for paper discovery (metadata.py)
 - pymupdf4llm for PDF-to-markdown conversion (converter.py)
+
+## Data Layout
+```
+~/.papertrail/                  # rclone mount (or local dir)
+  tags.json                     # Global tag vocabulary
+  papers/{bibtex_key}/
+    metadata.json               # Source of truth for all paper data
+    paper.pdf
+    paper.md
+    summary.json                # Convenience copy
+
+~/.cache/papertrail/
+  index.db                      # Ephemeral SQLite FTS5 index
+```
 
 ## Development
 - Run tests: `uv run pytest`
@@ -19,6 +34,7 @@ MCP server for managing an academic paper library.
 - All async code uses httpx for HTTP requests
 - BibTeX keys follow format: lastname_year_firstword (e.g., smith_2024_causal)
 - Paper files stored at ~/.papertrail/papers/{bibtex_key}/
-- SQLite database at ~/.papertrail/db/papers.db
+- Write pattern: write JSON (source of truth) first, then update SQLite index
 - All database methods are async (wrapped via asyncio.to_thread)
-- rclone sync is best-effort; server works fully offline
+- No sync/push logic; the rclone mount handles persistence
+- When reading or analyzing multiple papers, use Task subagents to read each paper in parallel (one subagent per paper) rather than reading them sequentially in the main context. This keeps large paper texts out of the main context window and runs reads concurrently.

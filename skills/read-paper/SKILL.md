@@ -1,7 +1,6 @@
 ---
 name: read-paper
 description: Read a paper from the papertrail library. Finds the paper, shows its summary, and reads relevant sections into context.
-disable-model-invocation: true
 ---
 
 # Read Paper

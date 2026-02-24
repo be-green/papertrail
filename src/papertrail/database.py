@@ -48,6 +48,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fulltext_fts USING fts5(
 );
 """
 
+DROP_SQL = """
+DROP TABLE IF EXISTS paper_tags;
+DROP TABLE IF EXISTS tags;
+DROP TABLE IF EXISTS papers;
+DROP TABLE IF EXISTS papers_fts;
+DROP TABLE IF EXISTS fulltext_fts;
+"""
+
 
 def _json_list_to_text(items: list[str]) -> str:
     """Convert a list of strings to space-separated text for FTS indexing."""
@@ -55,14 +63,14 @@ def _json_list_to_text(items: list[str]) -> str:
 
 
 class PaperDatabase:
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
+    def __init__(self, index_path: Path):
+        self.index_path = index_path
         self._connection: sqlite3.Connection | None = None
 
     def _ensure_connection(self) -> sqlite3.Connection:
         if self._connection is None:
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._connection = sqlite3.connect(str(self.db_path))
+            self.index_path.parent.mkdir(parents=True, exist_ok=True)
+            self._connection = sqlite3.connect(str(self.index_path), check_same_thread=False)
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.row_factory = sqlite3.Row
@@ -73,7 +81,80 @@ class PaperDatabase:
 
     def _sync_initialize(self) -> None:
         conn = self._ensure_connection()
+        conn.executescript(DROP_SQL)
         conn.executescript(SCHEMA_SQL)
+        conn.commit()
+
+    async def rebuild_from_papers(self, papers: list[PaperMetadata], tags: list[dict]) -> None:
+        await asyncio.to_thread(self._sync_rebuild_from_papers, papers, tags)
+
+    def _sync_rebuild_from_papers(self, papers: list[PaperMetadata], tags: list[dict]) -> None:
+        conn = self._ensure_connection()
+
+        # Bulk insert tags
+        for tag_data in tags:
+            conn.execute(
+                "INSERT OR IGNORE INTO tags (tag, description, paper_count) VALUES (?, ?, 0)",
+                (tag_data["tag"], tag_data.get("description")),
+            )
+
+        # Bulk insert papers and FTS entries
+        for paper in papers:
+            summary_json = json.dumps(paper.summary) if paper.summary else None
+            conn.execute(
+                """INSERT OR REPLACE INTO papers
+                (bibtex_key, title, authors, year, abstract, journal, doi, arxiv_id,
+                 ssrn_id, url, topics, keywords, fields_of_study, citation_count,
+                 added_date, status, summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    paper.bibtex_key,
+                    paper.title,
+                    json.dumps(paper.authors),
+                    paper.year,
+                    paper.abstract,
+                    paper.journal,
+                    paper.doi,
+                    paper.arxiv_id,
+                    paper.ssrn_id,
+                    paper.url,
+                    json.dumps(paper.topics),
+                    json.dumps(paper.keywords),
+                    json.dumps(paper.fields_of_study),
+                    paper.citation_count,
+                    paper.added_date,
+                    paper.status,
+                    summary_json,
+                ),
+            )
+            self._sync_update_fts(conn, paper)
+
+            # Insert paper_tags from the paper's tags list
+            for tag_name in paper.tags:
+                conn.execute(
+                    "INSERT OR IGNORE INTO paper_tags (bibtex_key, tag) VALUES (?, ?)",
+                    (paper.bibtex_key, tag_name),
+                )
+
+        # Recompute tag paper_counts
+        conn.execute(
+            """UPDATE tags SET paper_count = (
+                SELECT COUNT(*) FROM paper_tags WHERE paper_tags.tag = tags.tag
+            )"""
+        )
+
+        conn.commit()
+
+    async def rebuild_fulltext(self, paper_texts: list[tuple[str, str]]) -> None:
+        await asyncio.to_thread(self._sync_rebuild_fulltext, paper_texts)
+
+    def _sync_rebuild_fulltext(self, paper_texts: list[tuple[str, str]]) -> None:
+        conn = self._ensure_connection()
+        for bibtex_key, content in paper_texts:
+            conn.execute(
+                "INSERT INTO fulltext_fts (bibtex_key, content) VALUES (?, ?)",
+                (bibtex_key, content),
+            )
         conn.commit()
 
     async def upsert_paper(self, paper: PaperMetadata) -> None:
@@ -109,6 +190,21 @@ class PaperDatabase:
             ),
         )
         self._sync_update_fts(conn, paper)
+
+        # Update paper_tags from the paper's tags list
+        conn.execute("DELETE FROM paper_tags WHERE bibtex_key = ?", (paper.bibtex_key,))
+        for tag_name in paper.tags:
+            conn.execute(
+                "INSERT OR IGNORE INTO paper_tags (bibtex_key, tag) VALUES (?, ?)",
+                (paper.bibtex_key, tag_name),
+            )
+            conn.execute(
+                """UPDATE tags SET paper_count = (
+                    SELECT COUNT(*) FROM paper_tags WHERE tag = ?
+                ) WHERE tag = ?""",
+                (tag_name, tag_name),
+            )
+
         conn.commit()
 
     def _sync_update_fts(self, conn: sqlite3.Connection, paper: PaperMetadata) -> None:
@@ -353,6 +449,21 @@ class PaperDatabase:
             "SELECT 1 FROM papers WHERE bibtex_key = ?", (key,)
         ).fetchone()
         return row is not None
+
+    async def delete_paper(self, bibtex_key: str) -> bool:
+        return await asyncio.to_thread(self._sync_delete_paper, bibtex_key)
+
+    def _sync_delete_paper(self, bibtex_key: str) -> bool:
+        conn = self._ensure_connection()
+        row = conn.execute("SELECT 1 FROM papers WHERE bibtex_key = ?", (bibtex_key,)).fetchone()
+        if row is None:
+            return False
+        conn.execute("DELETE FROM paper_tags WHERE bibtex_key = ?", (bibtex_key,))
+        conn.execute("DELETE FROM papers_fts WHERE bibtex_key = ?", (bibtex_key,))
+        conn.execute("DELETE FROM fulltext_fts WHERE bibtex_key = ?", (bibtex_key,))
+        conn.execute("DELETE FROM papers WHERE bibtex_key = ?", (bibtex_key,))
+        conn.commit()
+        return True
 
     async def close(self) -> None:
         await asyncio.to_thread(self._sync_close)

@@ -1,9 +1,13 @@
+import asyncio
 import logging
 import re
+import time
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
+from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
 from papertrail.config import PapertrailConfig
 from papertrail.models import SearchResult
@@ -27,20 +31,88 @@ SSRN_ID_PATTERN = re.compile(r"^\d{5,}$")
 ARXIV_ID_PATTERN = re.compile(r"^(\d{4}\.\d{4,5})(v\d+)?$")
 DOI_PATTERN = re.compile(r"^10\.\d{4,}")
 
-
 UNPAYWALL_BASE = "https://api.unpaywall.org/v2"
+CROSSREF_BASE = "https://api.crossref.org/works"
+
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+}
+
+CLOUDFLARE_MARKERS = [
+    "Just a moment",
+    "cf-browser-verification",
+    "challenge-platform",
+    "_cf_chl",
+    "Checking your browser",
+    "Cloudflare",
+]
+
+NBER_WP_PATTERN = re.compile(r"/working_papers/(w\d+)|nber\.org/papers/(w\d+)")
+
+
+@dataclass
+class DownloadAttempt:
+    url: str
+    status_code: int | None = None
+    content_type: str = ""
+    cloudflare_blocked: bool = False
+    error: str | None = None
+
+
+@dataclass
+class DownloadResult:
+    success: bool
+    pdf_path: Path | None = None
+    attempts: list[DownloadAttempt] = field(default_factory=list)
+    candidate_urls: list[str] = field(default_factory=list)
+
+
+class _RateLimiter:
+    """Enforces a minimum interval between calls (e.g., 1 request/second)."""
+
+    def __init__(self, min_interval: float = 1.0):
+        self.min_interval = min_interval
+        self._last_request_time: float = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_request_time
+            if elapsed < self.min_interval:
+                await asyncio.sleep(self.min_interval - elapsed)
+            self._last_request_time = time.monotonic()
 
 
 class MetadataFetcher:
     def __init__(self, config: PapertrailConfig):
+        self.config = config
         self.api_key = config.semantic_scholar_api_key
         self.unpaywall_email = config.unpaywall_email
-        headers = {}
+        self._ss_rate_limiter = _RateLimiter(min_interval=1.0)
+
+        api_headers = {}
         if self.api_key:
-            headers["x-api-key"] = self.api_key
+            api_headers["x-api-key"] = self.api_key
         proxy = config.http_proxy or None
+
         self.client = httpx.AsyncClient(
-            timeout=30.0, headers=headers, follow_redirects=True, proxy=proxy
+            timeout=30.0, headers=api_headers, follow_redirects=True, proxy=proxy
+        )
+        self.download_client = httpx.AsyncClient(
+            timeout=60.0, headers=dict(BROWSER_HEADERS), follow_redirects=True, proxy=proxy
+        )
+        self._curl_session = CurlAsyncSession(
+            impersonate="chrome",
+            timeout=60,
+            allow_redirects=True,
+            proxy=proxy,
         )
 
     async def search(self, query: str, limit: int = 10) -> list[SearchResult]:
@@ -51,15 +123,24 @@ class MetadataFetcher:
         return self._deduplicate(combined)[:limit]
 
     async def get_by_identifier(self, identifier: str) -> SearchResult | None:
-        """Look up a paper by DOI, arXiv ID, SSRN ID/URL, or Semantic Scholar URL."""
+        """Look up a paper by DOI, arXiv ID, SSRN ID/URL, or Semantic Scholar URL.
+
+        Tries Semantic Scholar first, then CrossRef as a fallback for DOI-based lookups.
+        """
         paper_id = self._normalize_identifier(identifier)
         if paper_id is None:
             return None
 
         response = await self._ss_get(f"/paper/{paper_id}")
-        if response is None:
-            return None
-        return self._parse_ss_result(response)
+        if response is not None:
+            return self._parse_ss_result(response)
+
+        # Fallback to CrossRef for DOI-based identifiers
+        doi = self._extract_doi_from_identifier(identifier)
+        if doi:
+            return await self.get_crossref_metadata(doi)
+
+        return None
 
     async def get_ssrn_metadata(self, ssrn_id: str) -> SearchResult | None:
         """Scrape metadata from an SSRN abstract page as a fallback."""
@@ -100,6 +181,96 @@ class MetadataFetcher:
             source="ssrn",
         )
 
+    async def get_crossref_metadata(self, doi: str) -> SearchResult | None:
+        """Look up paper metadata via CrossRef API. Works for any DOI including SSRN."""
+        try:
+            response = await self.client.get(
+                f"{CROSSREF_BASE}/{doi}",
+                headers={"Accept": "application/json"},
+            )
+            if response.status_code != 200:
+                return None
+            data = response.json().get("message", {})
+            return self._parse_crossref_result(data)
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            logger.warning("CrossRef lookup failed for %s: %s", doi, exc)
+            return None
+
+    def _parse_crossref_result(self, data: dict) -> SearchResult | None:
+        """Parse a CrossRef API response into a SearchResult."""
+        titles = data.get("title", [])
+        if not titles:
+            return None
+        title = titles[0]
+
+        authors = []
+        for author in data.get("author", []):
+            given = author.get("given", "")
+            family = author.get("family", "")
+            if given and family:
+                authors.append(f"{given} {family}")
+            elif family:
+                authors.append(family)
+
+        year = None
+        for date_field in ("published-print", "published-online", "created"):
+            date_info = data.get(date_field)
+            if date_info and date_info.get("date-parts"):
+                parts = date_info["date-parts"][0]
+                if parts and parts[0]:
+                    year = parts[0]
+                    break
+
+        abstract = data.get("abstract", "")
+        if abstract:
+            abstract = re.sub(r"<[^>]+>", "", abstract).strip()
+
+        doi = data.get("DOI")
+        ssrn_id = None
+        if doi and "ssrn" in doi.lower():
+            ssrn_match = re.search(r"ssrn\.(\d+)", doi, re.IGNORECASE)
+            if ssrn_match:
+                ssrn_id = ssrn_match.group(1)
+
+        pdf_url = None
+        for link in data.get("link", []):
+            if link.get("content-type") == "application/pdf":
+                pdf_url = link.get("URL")
+                break
+
+        url = data.get("URL") or (f"https://doi.org/{doi}" if doi else None)
+
+        return SearchResult(
+            title=title,
+            authors=authors,
+            year=year,
+            abstract=abstract or None,
+            doi=doi,
+            ssrn_id=ssrn_id,
+            url=url,
+            open_access_pdf_url=pdf_url,
+            source="crossref",
+        )
+
+    def _extract_doi_from_identifier(self, identifier: str) -> str | None:
+        """Extract a DOI from a user-provided identifier string."""
+        identifier = identifier.strip()
+        if DOI_PATTERN.match(identifier):
+            return identifier
+        if identifier.upper().startswith("DOI:"):
+            return identifier[4:]
+        # SSRN URL -> SSRN DOI (handle both abstract= and abstract_id=)
+        ssrn_match = SSRN_ABSTRACT_PATTERN.search(identifier)
+        if ssrn_match:
+            return f"10.2139/ssrn.{ssrn_match.group(1)}"
+        ssrn_id_match = re.search(r"abstract_id=(\d+)", identifier)
+        if ssrn_id_match:
+            return f"10.2139/ssrn.{ssrn_id_match.group(1)}"
+        # Bare SSRN ID
+        if SSRN_ID_PATTERN.match(identifier):
+            return f"10.2139/ssrn.{identifier}"
+        return None
+
     def generate_bibtex_key(self, result: SearchResult) -> str:
         """Generate a bibtex key: lastname_year_firstword."""
         first_author_last = "unknown"
@@ -118,12 +289,20 @@ class MetadataFetcher:
 
         return f"{first_author_last}_{year}_{first_word}"
 
-    async def generate_unique_key(self, result: SearchResult, db) -> str:
-        """Generate a bibtex key, ensuring uniqueness by appending a suffix if needed."""
+    async def generate_unique_key(self, result: SearchResult, db, store=None) -> str:
+        """Generate a bibtex key, ensuring uniqueness by appending a suffix if needed.
+
+        Checks both the index (db) and the filesystem (store) to guarantee
+        uniqueness even if the index hasn't rebuilt yet.
+        """
         base_key = self.generate_bibtex_key(result)
         key = base_key
         suffix = ord("a")
-        while await db.check_bibtex_key_exists(key):
+        while True:
+            index_exists = await db.check_bibtex_key_exists(key)
+            store_exists = store.paper_dir_exists(key) if store else False
+            if not index_exists and not store_exists:
+                break
             key = f"{base_key}_{chr(suffix)}"
             suffix += 1
             if suffix > ord("z"):
@@ -131,16 +310,48 @@ class MetadataFetcher:
                 break
         return key
 
-    async def download_pdf(self, result: SearchResult, dest_path: Path) -> Path:
+    def get_candidate_urls(self, result: SearchResult) -> list[str]:
+        """Build an ordered list of candidate PDF download URLs for a paper."""
+        urls = []
+
+        if result.open_access_pdf_url:
+            urls.append(result.open_access_pdf_url)
+
+        if result.arxiv_id:
+            clean_id = result.arxiv_id.split("v")[0] if "v" in result.arxiv_id else result.arxiv_id
+            urls.append(f"https://arxiv.org/pdf/{clean_id}")
+
+        # NBER working papers (economics)
+        nber_url = self._get_nber_pdf_url(result)
+        if nber_url:
+            urls.append(nber_url)
+
+        if result.ssrn_id:
+            urls.append(f"https://papers.ssrn.com/sol3/Delivery.cfm?abstractid={result.ssrn_id}")
+
+        if result.doi:
+            urls.append(f"https://doi.org/{result.doi}")
+
+        if result.url and result.url not in urls:
+            urls.append(result.url)
+
+        return urls
+
+    async def download_pdf(self, result: SearchResult, dest_path: Path) -> DownloadResult:
         """Download the PDF for a paper, trying multiple sources.
+
+        Returns a DownloadResult with success status, path, and details of each attempt.
+        The caller can use candidate_urls for manual/browser-based fallback.
 
         Order of attempts:
         1. Open access PDF URL (from Semantic Scholar)
         2. arXiv PDF
-        3. SSRN direct download
-        4. Unpaywall (finds legal open access copies)
-        5. DOI redirect (works through institutional VPN/proxy)
-        6. Direct URL
+        3. NBER working paper PDF
+        4. SSRN direct download
+        5. Unpaywall (finds legal open access copies)
+        6. PubMed Central
+        7. DOI redirect (works through institutional VPN/proxy)
+        8. Direct URL
         """
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         urls_to_try = []
@@ -152,14 +363,24 @@ class MetadataFetcher:
             clean_id = result.arxiv_id.split("v")[0] if "v" in result.arxiv_id else result.arxiv_id
             urls_to_try.append(f"https://arxiv.org/pdf/{clean_id}")
 
+        nber_url = self._get_nber_pdf_url(result)
+        if nber_url:
+            urls_to_try.append(nber_url)
+
         if result.ssrn_id:
             urls_to_try.append(f"https://papers.ssrn.com/sol3/Delivery.cfm?abstractid={result.ssrn_id}")
 
-        # Try Unpaywall for a legal open access PDF
+        # Unpaywall
         if result.doi:
             unpaywall_url = await self._get_unpaywall_pdf_url(result.doi)
             if unpaywall_url:
                 urls_to_try.append(unpaywall_url)
+
+        # PubMed Central
+        if result.doi:
+            pmc_url = await self._get_pmc_pdf_url(result.doi)
+            if pmc_url:
+                urls_to_try.append(pmc_url)
 
         # DOI redirect — works through institutional VPN/proxy
         if result.doi:
@@ -168,22 +389,89 @@ class MetadataFetcher:
         if result.url and result.url not in urls_to_try:
             urls_to_try.append(result.url)
 
-        last_error = None
+        download_result = DownloadResult(
+            success=False,
+            candidate_urls=self.get_candidate_urls(result),
+        )
+
         for url in urls_to_try:
+            attempt = DownloadAttempt(url=url)
             try:
-                response = await self.client.get(url)
-                content_type = response.headers.get("content-type", "")
+                response = await self._download_get(url)
+                attempt.status_code = response.status_code
+                attempt.content_type = response.headers.get("content-type", "")
+
+                if response.status_code == 200 and self._is_cloudflare_challenge(response):
+                    attempt.cloudflare_blocked = True
+                    attempt.error = "Cloudflare challenge page"
+                    download_result.attempts.append(attempt)
+                    continue
+
                 if response.status_code == 200 and (
-                    "pdf" in content_type or response.content[:5] == b"%PDF-"
+                    "pdf" in attempt.content_type or response.content[:5] == b"%PDF-"
                 ):
                     dest_path.write_bytes(response.content)
-                    return dest_path
-                last_error = f"URL {url}: status={response.status_code}, content-type={content_type}"
-            except httpx.HTTPError as exc:
-                last_error = f"URL {url}: {exc}"
-                continue
+                    download_result.success = True
+                    download_result.pdf_path = dest_path
+                    download_result.attempts.append(attempt)
+                    return download_result
 
-        raise RuntimeError(f"Could not download PDF from any source. Last error: {last_error}")
+                attempt.error = f"Not a PDF: status={response.status_code}, content-type={attempt.content_type}"
+            except Exception as exc:
+                attempt.error = str(exc)
+            download_result.attempts.append(attempt)
+
+        return download_result
+
+    async def _download_get(self, url: str):
+        """Fetch a URL for PDF download. Uses curl_cffi (Chrome TLS fingerprint) if available."""
+        if self._curl_session:
+            try:
+                return await self._curl_session.get(
+                    url, headers={"Accept": "application/pdf,*/*;q=0.8"}
+                )
+            except Exception as exc:
+                logger.debug("curl_cffi request failed for %s: %s, falling back to httpx", url, exc)
+        return await self.download_client.get(
+            url, headers={"Accept": "application/pdf,*/*;q=0.8"}
+        )
+
+    def _is_cloudflare_challenge(self, response) -> bool:
+        """Detect Cloudflare challenge pages in a response."""
+        content_type = response.headers.get("content-type", "")
+        if "text/html" not in content_type:
+            return False
+        snippet = response.text[:2048]
+        return any(marker in snippet for marker in CLOUDFLARE_MARKERS)
+
+    def _get_nber_pdf_url(self, result: SearchResult) -> str | None:
+        """Extract an NBER working paper PDF URL if the paper is from NBER."""
+        sources_to_check = [result.url or "", result.open_access_pdf_url or ""]
+        for source in sources_to_check:
+            match = NBER_WP_PATTERN.search(source)
+            if match:
+                wp_id = match.group(1) or match.group(2)
+                return f"https://www.nber.org/system/files/working_papers/{wp_id}/{wp_id}.pdf"
+        return None
+
+    async def _get_pmc_pdf_url(self, doi: str) -> str | None:
+        """Check if a paper is available in PubMed Central."""
+        try:
+            response = await self.client.get(
+                "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/",
+                params={"ids": doi, "format": "json", "tool": "papertrail",
+                        "email": self.unpaywall_email or ""},
+            )
+            if response.status_code != 200:
+                return None
+            data = response.json()
+            records = data.get("records", [])
+            if records and records[0].get("pmcid"):
+                pmcid = records[0]["pmcid"]
+                return f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/pdf/"
+            return None
+        except (httpx.HTTPError, KeyError):
+            return None
 
     async def _get_unpaywall_pdf_url(self, doi: str) -> str | None:
         """Query Unpaywall for an open access PDF URL."""
@@ -210,11 +498,15 @@ class MetadataFetcher:
 
     async def close(self) -> None:
         await self.client.aclose()
+        await self.download_client.aclose()
+        if self._curl_session:
+            await self._curl_session.close()
 
     # --- Private methods ---
 
     async def _search_semantic_scholar(self, query: str, limit: int) -> list[SearchResult]:
         try:
+            await self._ss_rate_limiter.acquire()
             params = {
                 "query": query,
                 "fields": SEMANTIC_SCHOLAR_FIELDS,
@@ -251,6 +543,7 @@ class MetadataFetcher:
     async def _ss_get(self, path: str) -> dict | None:
         """Make a GET request to Semantic Scholar and return JSON or None."""
         try:
+            await self._ss_rate_limiter.acquire()
             response = await self.client.get(
                 f"{SEMANTIC_SCHOLAR_BASE}{path}",
                 params={"fields": SEMANTIC_SCHOLAR_FIELDS},
@@ -322,13 +615,25 @@ class MetadataFetcher:
         if oa_data and isinstance(oa_data, dict):
             oa_pdf = oa_data.get("url")
 
+        doi = external_ids.get("DOI")
+
+        # Extract SSRN ID from externalIds or from DOI
+        ssrn_id = None
+        if "SSRN" in external_ids:
+            ssrn_id = str(external_ids["SSRN"])
+        elif doi and "ssrn" in doi.lower():
+            ssrn_match = re.search(r"ssrn\.(\d+)", doi, re.IGNORECASE)
+            if ssrn_match:
+                ssrn_id = ssrn_match.group(1)
+
         return SearchResult(
             title=data.get("title", ""),
             authors=authors,
             year=data.get("year"),
             abstract=data.get("abstract"),
-            doi=external_ids.get("DOI"),
+            doi=doi,
             arxiv_id=external_ids.get("ArXiv"),
+            ssrn_id=ssrn_id,
             url=f"https://www.semanticscholar.org/paper/{data.get('paperId', '')}",
             citation_count=data.get("citationCount"),
             topics=topics,

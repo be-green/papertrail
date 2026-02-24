@@ -4,6 +4,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP, Context
 
@@ -12,7 +13,8 @@ from papertrail.converter import PdfConverter
 from papertrail.database import PaperDatabase
 from papertrail.metadata import MetadataFetcher
 from papertrail.models import PaperMetadata
-from papertrail.storage import StorageSync
+from papertrail.mount import mount_rclone, unmount_rclone
+from papertrail.paper_store import PaperStore
 
 logger = logging.getLogger(__name__)
 
@@ -20,16 +22,41 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
     config = PapertrailConfig.from_env()
+
+    # Auto-mount rclone remote if configured
+    rclone_proc = await mount_rclone(config.rclone_remote, config.data_dir)
+
     config.ensure_directories()
-    storage = StorageSync(config)
 
-    try:
-        await storage.sync_db(direction="pull")
-    except Exception as exc:
-        logger.debug("Could not pull DB from remote: %s", exc)
-
-    db = PaperDatabase(config.db_path)
+    store = PaperStore(config)
+    db = PaperDatabase(config.index_db_path)
     await db.initialize()
+
+    # Phase 1 (blocking): rebuild index from JSON files
+    papers = await asyncio.to_thread(store.scan_all_papers)
+    tags = await asyncio.to_thread(store.read_tags)
+    await db.rebuild_from_papers(papers, tags)
+    logger.info("Index rebuilt: %d papers, %d tags", len(papers), len(tags))
+
+    # Phase 2 (background): rebuild fulltext index from paper.md files
+    fulltext_ready = asyncio.Event()
+
+    async def rebuild_fulltext_index():
+        try:
+            paper_texts = []
+            for paper in papers:
+                content = await asyncio.to_thread(store.read_paper_markdown, paper.bibtex_key)
+                if content:
+                    paper_texts.append((paper.bibtex_key, content))
+            if paper_texts:
+                await db.rebuild_fulltext(paper_texts)
+            logger.info("Fulltext index rebuilt: %d papers", len(paper_texts))
+        except Exception:
+            logger.error("Fulltext index rebuild failed", exc_info=True)
+        finally:
+            fulltext_ready.set()
+
+    asyncio.create_task(rebuild_fulltext_index())
 
     fetcher = MetadataFetcher(config)
     converter = PdfConverter()
@@ -37,13 +64,15 @@ async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
     yield {
         "db": db,
         "config": config,
-        "storage": storage,
+        "store": store,
         "fetcher": fetcher,
         "converter": converter,
+        "fulltext_ready": fulltext_ready,
     }
 
     await fetcher.close()
     await db.close()
+    await unmount_rclone(config.data_dir, rclone_proc)
 
 
 mcp = FastMCP("papertrail", lifespan=lifespan)
@@ -119,7 +148,7 @@ async def ingest_paper(identifier: str, ctx: Context = None) -> str:
     config: PapertrailConfig = lc["config"]
     fetcher: MetadataFetcher = lc["fetcher"]
     converter: PdfConverter = lc["converter"]
-    storage: StorageSync = lc["storage"]
+    store: PaperStore = lc["store"]
 
     # 1. Look up metadata
     result = await fetcher.get_by_identifier(identifier)
@@ -129,17 +158,25 @@ async def ingest_paper(identifier: str, ctx: Context = None) -> str:
         import re
         ssrn_match = re.search(r"(?:abstract=|^)(\d{5,})", identifier)
         if ssrn_match:
-            result = await fetcher.get_ssrn_metadata(ssrn_match.group(1))
+            ssrn_id = ssrn_match.group(1)
+            result = await fetcher.get_crossref_metadata(f"10.2139/ssrn.{ssrn_id}")
+            if result is None:
+                result = await fetcher.get_ssrn_metadata(ssrn_id)
 
     if result is None:
         return f"Could not find paper with identifier: {identifier}. Try using find_paper to search by title."
 
     # 2. Generate unique bibtex key
-    bibtex_key = await fetcher.generate_unique_key(result, db)
+    bibtex_key = await fetcher.generate_unique_key(result, db, store)
     paper_dir = config.papers_dir / bibtex_key
     paper_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3. Create DB record
+    # 3. Download PDF (before writing metadata)
+    pdf_path = paper_dir / "paper.pdf"
+    dl = await fetcher.download_pdf(result, pdf_path)
+
+    # 4. Create paper metadata with correct initial status
+    initial_status = "converting" if dl.success else "pending_pdf"
     paper = PaperMetadata(
         bibtex_key=bibtex_key,
         title=result.title,
@@ -154,41 +191,47 @@ async def ingest_paper(identifier: str, ctx: Context = None) -> str:
         fields_of_study=result.fields_of_study,
         citation_count=result.citation_count,
         added_date=datetime.now(UTC).isoformat(),
-        status="downloading",
+        status=initial_status,
     )
+
+    # 5. Write JSON source of truth, then update index
+    await asyncio.to_thread(store.write_paper_metadata, paper)
     await db.upsert_paper(paper)
 
-    # 4. Download PDF
-    pdf_path = paper_dir / "paper.pdf"
-    try:
-        await fetcher.download_pdf(result, pdf_path)
-    except Exception as exc:
-        await db.update_status(bibtex_key, "error")
-        return f"Ingested metadata for **{bibtex_key}** but PDF download failed: {exc}"
-
-    # 5. Save metadata.json
-    metadata_path = paper_dir / "metadata.json"
-    metadata_path.write_text(json.dumps(result.model_dump(), indent=2, default=str))
+    if not dl.success:
+        failure_details = []
+        for attempt in dl.attempts:
+            detail = f"  - {attempt.url}: "
+            if attempt.cloudflare_blocked:
+                detail += "blocked by Cloudflare"
+            elif attempt.error:
+                detail += attempt.error
+            else:
+                detail += f"status={attempt.status_code}"
+            failure_details.append(detail)
+        details_text = "\n".join(failure_details) if failure_details else "  No URLs to try"
+        return (
+            f"Ingested metadata for **{bibtex_key}** but PDF download failed.\n\n"
+            f"**Attempts:**\n{details_text}\n\n"
+            f"To add the PDF manually, download it and place it at:\n"
+            f"  `{pdf_path}`\n\n"
+            f"Then call `ingest_paper_manual(\"{bibtex_key}\")` to continue processing."
+        )
 
     # 6. Start background conversion
-    await db.update_status(bibtex_key, "converting")
     md_path = paper_dir / "paper.md"
 
     async def background_convert():
         try:
             content = await converter.convert(pdf_path, md_path)
             await db.index_fulltext(bibtex_key, content)
+            paper.status = "summarizing"
+            await asyncio.to_thread(store.write_paper_metadata, paper)
             await db.update_status(bibtex_key, "summarizing")
-            # Push files to remote
-            try:
-                await storage.push_file(pdf_path, f"papers/{bibtex_key}/paper.pdf")
-                await storage.push_file(md_path, f"papers/{bibtex_key}/paper.md")
-                await storage.push_file(metadata_path, f"papers/{bibtex_key}/metadata.json")
-                await storage.sync_db(direction="push")
-            except Exception:
-                logger.debug("Remote sync failed during background convert", exc_info=True)
         except Exception:
             logger.error("Background conversion failed for %s", bibtex_key, exc_info=True)
+            paper.status = "error"
+            await asyncio.to_thread(store.write_paper_metadata, paper)
             await db.update_status(bibtex_key, "error")
 
     asyncio.create_task(background_convert())
@@ -217,6 +260,7 @@ async def conversion_status(bibtex_key: str, ctx: Context = None) -> str:
         return f"No paper found with key: {bibtex_key}"
     status_desc = {
         "downloading": "PDF is being downloaded",
+        "pending_pdf": "Metadata saved but PDF download failed. Place PDF manually and call ingest_paper_manual.",
         "converting": "PDF is being converted to markdown (this may take a minute)",
         "summarizing": "Conversion complete. Ready for summary generation.",
         "ready": "Fully processed with summary",
@@ -224,6 +268,96 @@ async def conversion_status(bibtex_key: str, ctx: Context = None) -> str:
     }
     desc = status_desc.get(paper.status, paper.status)
     return f"**{paper.title}**\nStatus: **{paper.status}** - {desc}"
+
+
+@mcp.tool()
+async def ingest_paper_manual(
+    bibtex_key: str,
+    pdf_url: str | None = None,
+    pdf_source_path: str | None = None,
+    ctx: Context = None,
+) -> str:
+    """Provide a PDF for a paper that failed automatic download.
+
+    The paper must already exist in the library (from a prior ingest_paper call).
+    Provide either a direct PDF URL to download from, a local file path, or
+    place the PDF at ~/.papertrail/papers/{bibtex_key}/paper.pdf beforehand.
+
+    Args:
+        bibtex_key: The paper's BibTeX key
+        pdf_url: Optional URL to download the PDF from (e.g., NBER working paper URL)
+        pdf_source_path: Optional absolute path to a local PDF file
+    """
+    lc = _get_context(ctx)
+    db: PaperDatabase = lc["db"]
+    config: PapertrailConfig = lc["config"]
+    converter: PdfConverter = lc["converter"]
+    fetcher: MetadataFetcher = lc["fetcher"]
+    store: PaperStore = lc["store"]
+
+    paper = await asyncio.to_thread(store.read_paper_metadata, bibtex_key)
+    if paper is None:
+        paper = await db.get_paper(bibtex_key)
+    if paper is None:
+        return f"No paper found with key: {bibtex_key}"
+
+    paper_dir = config.papers_dir / bibtex_key
+    paper_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = paper_dir / "paper.pdf"
+
+    if pdf_url:
+        try:
+            response = await fetcher._download_get(pdf_url)
+            content_type = response.headers.get("content-type", "")
+            if response.status_code == 200 and (
+                "pdf" in content_type or response.content[:5] == b"%PDF-"
+            ):
+                pdf_path.write_bytes(response.content)
+            else:
+                return (
+                    f"Failed to download PDF from URL: status={response.status_code}, "
+                    f"content-type={content_type}"
+                )
+        except Exception as exc:
+            return f"Failed to download PDF from URL: {exc}"
+    elif pdf_source_path:
+        import shutil
+        source = Path(pdf_source_path)
+        if not source.exists():
+            return f"Source PDF not found at: {pdf_source_path}"
+        shutil.copy2(source, pdf_path)
+
+    if not pdf_path.exists():
+        return (
+            f"No PDF found at `{pdf_path}`.\n"
+            f"Provide a pdf_url, pdf_source_path, or place the PDF there manually."
+        )
+
+    # Start conversion
+    paper.status = "converting"
+    await asyncio.to_thread(store.write_paper_metadata, paper)
+    await db.update_status(bibtex_key, "converting")
+    md_path = paper_dir / "paper.md"
+
+    async def background_convert():
+        try:
+            content = await converter.convert(pdf_path, md_path)
+            await db.index_fulltext(bibtex_key, content)
+            paper.status = "summarizing"
+            await asyncio.to_thread(store.write_paper_metadata, paper)
+            await db.update_status(bibtex_key, "summarizing")
+        except Exception:
+            logger.error("Conversion failed for %s", bibtex_key, exc_info=True)
+            paper.status = "error"
+            await asyncio.to_thread(store.write_paper_metadata, paper)
+            await db.update_status(bibtex_key, "error")
+
+    asyncio.create_task(background_convert())
+
+    return (
+        f"PDF registered for **{bibtex_key}**. Converting to markdown in the background.\n"
+        f"Use `conversion_status(\"{bibtex_key}\")` to check progress."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -251,16 +385,17 @@ async def read_paper(
     if not md_path.exists():
         return f"No markdown file found for {bibtex_key}. Check conversion_status."
     content = md_path.read_text(encoding="utf-8")
+    lines = content.splitlines()
+    total_lines = len(lines)
     if start_line is not None or end_line is not None:
-        lines = content.splitlines()
         start_idx = (start_line or 1) - 1
-        end_idx = end_line or len(lines)
+        end_idx = end_line or total_lines
         selected = lines[start_idx:end_idx]
         return (
-            f"Lines {start_idx + 1}-{min(end_idx, len(lines))} of {len(lines)} total:\n\n"
+            f"Lines {start_idx + 1}-{min(end_idx, total_lines)} of {total_lines} total:\n\n"
             + "\n".join(selected)
         )
-    return content
+    return f"Total lines: {total_lines}\n\n" + content
 
 
 @mcp.tool()
@@ -335,10 +470,11 @@ async def store_summary(
     """
     lc = _get_context(ctx)
     db: PaperDatabase = lc["db"]
-    storage: StorageSync = lc["storage"]
-    config: PapertrailConfig = lc["config"]
+    store: PaperStore = lc["store"]
 
-    paper = await db.get_paper(bibtex_key)
+    paper = await asyncio.to_thread(store.read_paper_metadata, bibtex_key)
+    if paper is None:
+        paper = await db.get_paper(bibtex_key)
     if paper is None:
         return f"No paper found with key: {bibtex_key}"
 
@@ -347,21 +483,19 @@ async def store_summary(
     except json.JSONDecodeError as exc:
         return f"Invalid JSON in summary: {exc}"
 
+    # Update paper metadata (source of truth)
+    paper.summary = summary_data
+    paper.status = "ready"
+    if keywords:
+        paper.keywords = keywords
+    await asyncio.to_thread(store.write_paper_metadata, paper)
+    await asyncio.to_thread(store.write_summary_file, bibtex_key, summary_data)
+
+    # Update index
     await db.store_summary(bibtex_key, summary_data)
     if keywords:
         await db.update_keywords(bibtex_key, keywords)
     await db.update_status(bibtex_key, "ready")
-
-    # Save summary.json to paper directory
-    summary_path = config.papers_dir / bibtex_key / "summary.json"
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(json.dumps(summary_data, indent=2))
-
-    try:
-        await storage.push_file(summary_path, f"papers/{bibtex_key}/summary.json")
-        await storage.sync_db(direction="push")
-    except Exception:
-        logger.debug("Remote sync failed after storing summary", exc_info=True)
 
     return f"Summary stored for **{bibtex_key}**. Status set to 'ready'."
 
@@ -416,6 +550,11 @@ async def search_paper_text(query: str, limit: int = 10, ctx: Context = None) ->
     """
     lc = _get_context(ctx)
     db: PaperDatabase = lc["db"]
+    fulltext_ready: asyncio.Event = lc["fulltext_ready"]
+
+    if not fulltext_ready.is_set():
+        return "Fulltext index is still building. Please try again in a moment."
+
     results = await db.search_fulltext(query, limit=limit)
     if not results:
         return f"No matches for '{query}' in paper full text."
@@ -493,7 +632,7 @@ async def add_tags(tags: str, ctx: Context = None) -> str:
     """
     lc = _get_context(ctx)
     db: PaperDatabase = lc["db"]
-    storage: StorageSync = lc["storage"]
+    store: PaperStore = lc["store"]
 
     try:
         tag_list = json.loads(tags) if isinstance(tags, str) else tags
@@ -503,12 +642,17 @@ async def add_tags(tags: str, ctx: Context = None) -> str:
     if not isinstance(tag_list, list):
         return "Expected a JSON array of tag objects."
 
-    await db.add_tags(tag_list)
+    # Update source of truth: merge into tags.json
+    existing_tags = await asyncio.to_thread(store.read_tags)
+    existing_tag_names = {t["tag"] for t in existing_tags}
+    for new_tag in tag_list:
+        if new_tag["tag"] not in existing_tag_names:
+            existing_tags.append(new_tag)
+            existing_tag_names.add(new_tag["tag"])
+    await asyncio.to_thread(store.write_tags, existing_tags)
 
-    try:
-        await storage.sync_db(direction="push")
-    except Exception:
-        pass
+    # Update index
+    await db.add_tags(tag_list)
 
     tag_names = [t["tag"] for t in tag_list]
     return f"Added tags: {', '.join(tag_names)}"
@@ -524,9 +668,11 @@ async def tag_paper(bibtex_key: str, tags: str, ctx: Context = None) -> str:
     """
     lc = _get_context(ctx)
     db: PaperDatabase = lc["db"]
-    storage: StorageSync = lc["storage"]
+    store: PaperStore = lc["store"]
 
-    paper = await db.get_paper(bibtex_key)
+    paper = await asyncio.to_thread(store.read_paper_metadata, bibtex_key)
+    if paper is None:
+        paper = await db.get_paper(bibtex_key)
     if paper is None:
         return f"No paper found with key: {bibtex_key}"
 
@@ -544,40 +690,79 @@ async def tag_paper(bibtex_key: str, tags: str, ctx: Context = None) -> str:
     if missing:
         return f"Tags not in vocabulary: {', '.join(missing)}. Use add_tags first."
 
-    await db.tag_paper(bibtex_key, tag_list)
+    # Update source of truth: append new tags to paper's tag list
+    current_tags = set(paper.tags)
+    for tag_name in tag_list:
+        current_tags.add(tag_name)
+    paper.tags = sorted(current_tags)
+    await asyncio.to_thread(store.write_paper_metadata, paper)
 
-    try:
-        await storage.sync_db(direction="push")
-    except Exception:
-        pass
+    # Update index
+    await db.tag_paper(bibtex_key, tag_list)
 
     return f"Tagged **{bibtex_key}** with: {', '.join(tag_list)}"
 
 
 # ---------------------------------------------------------------------------
-# Sync
+# Paper management
 # ---------------------------------------------------------------------------
 
 
 @mcp.tool()
-async def sync(direction: str = "push", ctx: Context = None) -> str:
-    """Force rclone sync between local storage and remote.
+async def delete_paper(bibtex_key: str, ctx: Context = None) -> str:
+    """Delete a paper from the library entirely (both files and index).
 
     Args:
-        direction: "push" (local to remote) or "pull" (remote to local)
+        bibtex_key: The paper's BibTeX key
     """
     lc = _get_context(ctx)
-    storage: StorageSync = lc["storage"]
-    if not await storage.is_available():
-        return "Sync not available. rclone is not configured or PAPERTRAIL_RCLONE_REMOTE is not set."
-    try:
-        if direction == "pull":
-            result = await storage.pull()
-        else:
-            result = await storage.push()
-        return f"Sync complete ({direction}).\n{result}" if result else f"Sync complete ({direction})."
-    except Exception as exc:
-        return f"Sync failed: {exc}"
+    db: PaperDatabase = lc["db"]
+    store: PaperStore = lc["store"]
+
+    deleted_from_index = await db.delete_paper(bibtex_key)
+    deleted_from_store = await asyncio.to_thread(store.delete_paper_dir, bibtex_key)
+
+    if not deleted_from_index and not deleted_from_store:
+        return f"No paper found with key: {bibtex_key}"
+    return f"Deleted **{bibtex_key}** from the library."
+
+
+# ---------------------------------------------------------------------------
+# Index rebuild (replaces sync)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def rebuild_index(ctx: Context = None) -> str:
+    """Force a full rescan of the paper library and rebuild the search index.
+
+    Use this if the index seems stale or after manually adding/modifying files.
+    """
+    lc = _get_context(ctx)
+    db: PaperDatabase = lc["db"]
+    store: PaperStore = lc["store"]
+
+    await db.initialize()
+
+    papers = await asyncio.to_thread(store.scan_all_papers)
+    tags = await asyncio.to_thread(store.read_tags)
+    await db.rebuild_from_papers(papers, tags)
+
+    paper_texts = []
+    for paper in papers:
+        content = await asyncio.to_thread(store.read_paper_markdown, paper.bibtex_key)
+        if content:
+            paper_texts.append((paper.bibtex_key, content))
+    if paper_texts:
+        await db.rebuild_fulltext(paper_texts)
+
+    fulltext_ready: asyncio.Event = lc["fulltext_ready"]
+    fulltext_ready.set()
+
+    return (
+        f"Index rebuilt: {len(papers)} papers, {len(tags)} tags, "
+        f"{len(paper_texts)} fulltext entries."
+    )
 
 
 # ---------------------------------------------------------------------------
