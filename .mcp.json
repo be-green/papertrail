@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "papertrail": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/Users/bcg/Documents/Projects/papertrail",
+        "run",
+        "papertrail"
+      ],
+      "env": {
+        "PAPERTRAIL_DATA_DIR": "${HOME}/.papertrail",
+        "PAPERTRAIL_RCLONE_REMOTE": ""
+      }
+    }
+  }
+}
