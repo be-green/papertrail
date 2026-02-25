@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -13,7 +14,7 @@ from papertrail.converter import PdfConverter
 from papertrail.database import PaperDatabase
 from papertrail.metadata import MetadataFetcher
 from papertrail.models import PaperMetadata
-from papertrail.mount import mount_rclone, unmount_rclone
+from papertrail.sync import sync_pull, sync_pull_if_stale, sync_push, sync_delete
 from papertrail.paper_store import PaperStore
 
 logger = logging.getLogger(__name__)
@@ -23,8 +24,9 @@ logger = logging.getLogger(__name__)
 async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
     config = PapertrailConfig.from_env()
 
-    # Auto-mount rclone remote if configured
-    rclone_proc = await mount_rclone(config.rclone_remote, config.data_dir)
+    # Sync remote data to local directory
+    await sync_pull(config.rclone_remote, config.data_dir)
+    sync_state = {"last_pull_time": time.monotonic()}
 
     config.ensure_directories()
 
@@ -68,11 +70,12 @@ async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
         "fetcher": fetcher,
         "converter": converter,
         "fulltext_ready": fulltext_ready,
+        "remote": config.rclone_remote,
+        "sync_state": sync_state,
     }
 
     await fetcher.close()
     await db.close()
-    await unmount_rclone(config.data_dir, rclone_proc)
 
 
 mcp = FastMCP("papertrail", lifespan=lifespan)
@@ -99,6 +102,33 @@ def _format_citation(paper: PaperMetadata) -> str:
     else:
         name = f"{last_name(paper.authors[0])} et al."
     return f"{name} ({year})"
+
+
+async def _ensure_synced(lc: dict) -> None:
+    """Re-pull from remote if the last sync is stale, then rebuild the index."""
+    config: PapertrailConfig = lc["config"]
+    sync_state = lc["sync_state"]
+    new_time = await sync_pull_if_stale(
+        lc["remote"], config.data_dir, sync_state["last_pull_time"]
+    )
+    if new_time != sync_state["last_pull_time"]:
+        sync_state["last_pull_time"] = new_time
+        db: PaperDatabase = lc["db"]
+        store: PaperStore = lc["store"]
+        papers = await asyncio.to_thread(store.scan_all_papers)
+        tags = await asyncio.to_thread(store.read_tags)
+        await db.rebuild_from_papers(papers, tags)
+        logger.info("Index refreshed after re-sync: %d papers", len(papers))
+
+
+async def _push_paper(lc: dict, bibtex_key: str) -> None:
+    """Push a paper directory to the remote after a local write."""
+    await sync_push(lc["remote"], lc["config"].data_dir, f"papers/{bibtex_key}")
+
+
+async def _push_tags(lc: dict) -> None:
+    """Push tags.json to the remote after a local write."""
+    await sync_push(lc["remote"], lc["config"].data_dir, "tags.json")
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +193,7 @@ async def ingest_paper(identifier: str, ctx: Context = None) -> str:
                     SSRN URL/ID, or direct paper URL
     """
     lc = _get_context(ctx)
+    await _ensure_synced(lc)
     db: PaperDatabase = lc["db"]
     config: PapertrailConfig = lc["config"]
     fetcher: MetadataFetcher = lc["fetcher"]
@@ -216,6 +247,7 @@ async def ingest_paper(identifier: str, ctx: Context = None) -> str:
     # 5. Write JSON source of truth, then update index
     await asyncio.to_thread(store.write_paper_metadata, paper)
     await db.upsert_paper(paper)
+    await _push_paper(lc, bibtex_key)
 
     if not dl.success:
         failure_details = []
@@ -252,6 +284,7 @@ async def ingest_paper(identifier: str, ctx: Context = None) -> str:
             paper.status = "error"
             await asyncio.to_thread(store.write_paper_metadata, paper)
             await db.update_status(bibtex_key, "error")
+        await _push_paper(lc, bibtex_key)
 
     asyncio.create_task(background_convert())
 
@@ -370,6 +403,7 @@ async def ingest_paper_manual(
             paper.status = "error"
             await asyncio.to_thread(store.write_paper_metadata, paper)
             await db.update_status(bibtex_key, "error")
+        await _push_paper(lc, bibtex_key)
 
     asyncio.create_task(background_convert())
 
@@ -399,6 +433,7 @@ async def read_paper(
         end_line: Optional end line number (1-indexed, inclusive)
     """
     lc = _get_context(ctx)
+    await _ensure_synced(lc)
     config: PapertrailConfig = lc["config"]
     md_path = config.papers_dir / bibtex_key / "paper.md"
     if not md_path.exists():
@@ -425,6 +460,7 @@ async def get_paper_metadata(bibtex_key: str, ctx: Context = None) -> str:
         bibtex_key: The paper's BibTeX key
     """
     lc = _get_context(ctx)
+    await _ensure_synced(lc)
     db: PaperDatabase = lc["db"]
     paper = await db.get_paper(bibtex_key)
     if paper is None:
@@ -488,6 +524,7 @@ async def store_summary(
         keywords: Optional list of descriptive keywords for the paper
     """
     lc = _get_context(ctx)
+    await _ensure_synced(lc)
     db: PaperDatabase = lc["db"]
     store: PaperStore = lc["store"]
 
@@ -515,6 +552,7 @@ async def store_summary(
     if keywords:
         await db.update_keywords(bibtex_key, keywords)
     await db.update_status(bibtex_key, "ready")
+    await _push_paper(lc, bibtex_key)
 
     return f"Summary stored for **{bibtex_key}**. Status set to 'ready'."
 
@@ -536,6 +574,7 @@ async def search_library(query: str, limit: int = 20, ctx: Context = None) -> st
         limit: Maximum results to return (default 20)
     """
     lc = _get_context(ctx)
+    await _ensure_synced(lc)
     db: PaperDatabase = lc["db"]
     results = await db.search_metadata(query, limit=limit)
     if not results:
@@ -566,6 +605,7 @@ async def search_paper_text(query: str, limit: int = 10, ctx: Context = None) ->
         limit: Maximum results to return (default 10)
     """
     lc = _get_context(ctx)
+    await _ensure_synced(lc)
     db: PaperDatabase = lc["db"]
     fulltext_ready: asyncio.Event = lc["fulltext_ready"]
 
@@ -603,6 +643,7 @@ async def list_papers(
         limit: Maximum number of papers to return (default 50)
     """
     lc = _get_context(ctx)
+    await _ensure_synced(lc)
     db: PaperDatabase = lc["db"]
     papers = await db.list_papers(status=status, tag=tag, limit=limit)
     if not papers:
@@ -631,6 +672,7 @@ async def list_tags(prefix: str | None = None, ctx: Context = None) -> str:
         prefix: Optional prefix to filter tags (e.g., "climate" returns "climate-risk", "climate-finance", etc.)
     """
     lc = _get_context(ctx)
+    await _ensure_synced(lc)
     db: PaperDatabase = lc["db"]
     tags = await db.list_tags(prefix=prefix)
     if not tags:
@@ -673,6 +715,7 @@ async def add_tags(tags: str, ctx: Context = None) -> str:
 
     # Update index
     await db.add_tags(tag_list)
+    await _push_tags(lc)
 
     tag_names = [t["tag"] for t in tag_list]
     return f"Added tags: {', '.join(tag_names)}"
@@ -687,6 +730,7 @@ async def tag_paper(bibtex_key: str, tags: str, ctx: Context = None) -> str:
         tags: JSON array of tag names, e.g. ["causal-inference", "macro"]
     """
     lc = _get_context(ctx)
+    await _ensure_synced(lc)
     db: PaperDatabase = lc["db"]
     store: PaperStore = lc["store"]
 
@@ -719,6 +763,7 @@ async def tag_paper(bibtex_key: str, tags: str, ctx: Context = None) -> str:
 
     # Update index
     await db.tag_paper(bibtex_key, tag_list)
+    await _push_paper(lc, bibtex_key)
 
     return f"Tagged **{bibtex_key}** with: {', '.join(tag_list)}"
 
@@ -736,6 +781,7 @@ async def delete_paper(bibtex_key: str, ctx: Context = None) -> str:
         bibtex_key: The paper's BibTeX key
     """
     lc = _get_context(ctx)
+    await _ensure_synced(lc)
     db: PaperDatabase = lc["db"]
     store: PaperStore = lc["store"]
 
@@ -744,6 +790,7 @@ async def delete_paper(bibtex_key: str, ctx: Context = None) -> str:
 
     if not deleted_from_index and not deleted_from_store:
         return f"No paper found with key: {bibtex_key}"
+    await sync_delete(lc["remote"], f"papers/{bibtex_key}")
     return f"Deleted **{bibtex_key}** from the library."
 
 
