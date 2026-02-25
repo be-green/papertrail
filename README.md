@@ -9,7 +9,7 @@ An MCP server for managing an academic paper library with Claude Code. Search fo
 - **Generate summaries** with section-level detail, key results, tables, and figures
 - **Manage tags** with a growing vocabulary for consistent categorization
 - **Full-text search** over metadata, summaries, and paper content (SQLite FTS5)
-- **Sync across machines** via rclone mount (S3, Google Cloud, Backblaze, Dropbox, and [40+ other backends](https://rclone.org/overview/))
+- **Sync across machines** via rclone (S3, Wasabi, Google Cloud, Backblaze, Dropbox, and [40+ other backends](https://rclone.org/overview/))
 - **Literature reviews** across multiple papers using parallel subagents
 
 ## Installation
@@ -70,10 +70,11 @@ At this point you're done -- papertrail will store everything locally in
 
 ### Step 4: Set up cloud sync with rclone (optional)
 
-[rclone](https://rclone.org/) lets you mount cloud storage (S3, Wasabi, Google
-Cloud, Backblaze, Dropbox, etc.) as a local folder. When configured, papertrail
-reads and writes directly to the mount, so your library stays in sync across
-machines automatically.
+[rclone](https://rclone.org/) syncs your library to cloud storage (S3, Wasabi,
+Google Cloud, Backblaze, Dropbox, etc.) so it stays consistent across machines.
+On startup, papertrail pulls the remote state to `~/.papertrail/`. After each
+write (ingesting a paper, storing a summary, tagging), it pushes the changed
+files back. No FUSE mount required.
 
 #### 4a. Install rclone
 
@@ -86,20 +87,7 @@ sudo apt install rclone   # Debian/Ubuntu
 # Or: curl https://rclone.org/install.sh | sudo bash
 ```
 
-#### 4b. Install a FUSE provider (macOS only)
-
-`rclone mount` needs FUSE (Filesystem in Userspace) to make remote storage
-appear as a local directory. Linux has this built in. On macOS, install one of:
-
-```bash
-# FUSE-T (recommended -- lightweight, no reboot needed)
-brew install --cask fuse-t
-
-# OR macFUSE (more mature, but requires a reboot after install)
-brew install --cask macfuse
-```
-
-#### 4c. Configure a remote
+#### 4b. Configure a remote
 
 Run `rclone config` and follow the interactive prompts to connect your storage
 provider. This creates a named remote you'll reference later. See
@@ -111,7 +99,7 @@ rclone config
 # Example: create a remote named "myremote" pointing to an S3-compatible bucket
 ```
 
-#### 4d. Create your bucket and update the config
+#### 4c. Create your bucket and update the config
 
 ```bash
 # Create the bucket on your remote
@@ -121,8 +109,9 @@ rclone mkdir myremote:my-papertrail-bucket
 # "PAPERTRAIL_RCLONE_REMOTE": "myremote:my-papertrail-bucket"
 ```
 
-Restart Claude Code. On startup, papertrail will automatically mount the remote
-at `~/.papertrail` and unmount it on shutdown.
+Restart Claude Code. On startup, papertrail will sync the remote bucket to
+`~/.papertrail` and rebuild the search index. During a session, it periodically
+re-syncs to pick up changes made on other machines.
 
 ## Usage
 
@@ -168,7 +157,7 @@ Runs the full pipeline: find, download, convert to markdown, generate a structur
 
 | Environment variable | Default | Description |
 |---------------------|---------|-------------|
-| `PAPERTRAIL_DATA_DIR` | `~/.papertrail` | Data directory (rclone mount point if remote is set) |
+| `PAPERTRAIL_DATA_DIR` | `~/.papertrail` | Local data directory (synced from remote if configured) |
 | `PAPERTRAIL_RCLONE_REMOTE` | (empty) | rclone remote path (e.g., `myremote:my-bucket`) |
 | `PAPERTRAIL_INDEX_DIR` | `~/.cache/papertrail` | Local directory for the ephemeral search index |
 | `PAPERTRAIL_SEMANTIC_SCHOLAR_API_KEY` | (none) | Optional API key for higher rate limits |
