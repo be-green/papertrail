@@ -82,6 +82,25 @@ def _get_context(ctx: Context) -> dict:
     return ctx.request_context.lifespan_context
 
 
+def _format_citation(paper: PaperMetadata) -> str:
+    """Format a paper as a human-readable citation: Last (Year) or Last and Last (Year)."""
+    year = paper.year or "n.d."
+    if not paper.authors:
+        return f"Unknown ({year})"
+    def last_name(author: str) -> str:
+        # Handle "Last, First" and "First Last" formats
+        if "," in author:
+            return author.split(",")[0].strip()
+        return author.split()[-1]
+    if len(paper.authors) == 1:
+        name = last_name(paper.authors[0])
+    elif len(paper.authors) == 2:
+        name = f"{last_name(paper.authors[0])} and {last_name(paper.authors[1])}"
+    else:
+        name = f"{last_name(paper.authors[0])} et al."
+    return f"{name} ({year})"
+
+
 # ---------------------------------------------------------------------------
 # Paper discovery
 # ---------------------------------------------------------------------------
@@ -525,10 +544,8 @@ async def search_library(query: str, limit: int = 20, ctx: Context = None) -> st
     for paper in results:
         paper_tags = await db.get_paper_tags(paper.bibtex_key)
         tags_str = f" [{', '.join(paper_tags)}]" if paper_tags else ""
-        authors_str = ", ".join(paper.authors[:3])
-        if len(paper.authors) > 3:
-            authors_str += " et al."
-        entry = f"- **{paper.bibtex_key}**: {paper.title} ({paper.year}) by {authors_str}{tags_str}"
+        citation = _format_citation(paper)
+        entry = f"- **{citation}**: {paper.title}{tags_str} `{paper.bibtex_key}`"
         if paper.abstract:
             truncated = paper.abstract[:150] + "..." if len(paper.abstract) > 150 else paper.abstract
             entry += f"\n  {truncated}"
@@ -560,7 +577,9 @@ async def search_paper_text(query: str, limit: int = 10, ctx: Context = None) ->
         return f"No matches for '{query}' in paper full text."
     lines = []
     for r in results:
-        lines.append(f"**{r['bibtex_key']}**: ...{r['snippet']}...")
+        paper = await db.get_paper(r["bibtex_key"])
+        cite = _format_citation(paper) if paper else r["bibtex_key"]
+        lines.append(f"**{cite}** `{r['bibtex_key']}`: ...{r['snippet']}...")
     return "\n\n".join(lines)
 
 
@@ -592,8 +611,9 @@ async def list_papers(
     for paper in papers:
         paper_tags = await db.get_paper_tags(paper.bibtex_key)
         tags_str = f" [{', '.join(paper_tags)}]" if paper_tags else ""
+        citation = _format_citation(paper)
         lines.append(
-            f"- **{paper.bibtex_key}**: {paper.title} ({paper.year}){tags_str} [{paper.status}]"
+            f"- **{citation}**: {paper.title}{tags_str} `{paper.bibtex_key}` [{paper.status}]"
         )
     return "\n".join(lines)
 
