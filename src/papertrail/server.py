@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -396,6 +397,60 @@ async def download_paper(
         f"PDF registered for **{bibtex_key}**. Converting to markdown in the background.\n"
         f"Use `conversion_status(\"{bibtex_key}\")` to check progress."
     )
+
+
+# ---------------------------------------------------------------------------
+# BibTeX citation
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def fetch_bibtex(bibtex_key: str, ctx: Context = None) -> str:
+    """Fetch the publisher BibTeX entry for a paper via DOI content negotiation.
+
+    Downloads the canonical BibTeX from the publisher, replaces the cite key
+    with the papertrail key, and stores it as citation.bib in the paper directory.
+
+    Args:
+        bibtex_key: The paper's BibTeX key
+    """
+    lc = _get_context(ctx)
+    await _ensure_synced(lc)
+    store: PaperStore = lc["store"]
+    fetcher: MetadataFetcher = lc["fetcher"]
+
+    paper = await asyncio.to_thread(store.read_paper_metadata, bibtex_key)
+    if paper is None:
+        return f"No paper found with key: {bibtex_key}"
+
+    if not paper.doi:
+        return (
+            f"Paper **{bibtex_key}** has no DOI. Cannot fetch BibTeX via content negotiation.\n"
+            f"You can manually create `~/.papertrail/papers/{bibtex_key}/citation.bib`."
+        )
+
+    # Fetch BibTeX via DOI content negotiation
+    try:
+        response = await fetcher.client.get(
+            f"https://doi.org/{paper.doi}",
+            headers={"Accept": "application/x-bibtex"},
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        return f"Failed to fetch BibTeX for DOI {paper.doi}: {exc}"
+
+    entry = response.text.strip()
+
+    # Replace the publisher's cite key with our bibtex key
+    entry = re.sub(r"(@\w+)\{[^,]+,", rf"\1{{{bibtex_key},", entry, count=1)
+
+    # Fix en-dash in page ranges to BibTeX double-dash
+    entry = entry.replace("\u2013", "--")
+
+    await asyncio.to_thread(store.write_bibtex, bibtex_key, entry)
+    await _push_paper(lc, bibtex_key)
+
+    return f"BibTeX saved for **{bibtex_key}**:\n\n```bibtex\n{entry}\n```"
 
 
 # ---------------------------------------------------------------------------
