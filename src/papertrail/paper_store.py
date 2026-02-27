@@ -86,6 +86,18 @@ class PaperStore:
             return None
         return md_path.read_text(encoding="utf-8")
 
+    def write_bibtex(self, bibtex_key: str, bibtex_entry: str) -> None:
+        paper_dir = self.config.papers_dir / bibtex_key
+        paper_dir.mkdir(parents=True, exist_ok=True)
+        bib_path = paper_dir / "citation.bib"
+        bib_path.write_text(bibtex_entry, encoding="utf-8")
+
+    def read_bibtex(self, bibtex_key: str) -> str | None:
+        bib_path = self.config.papers_dir / bibtex_key / "citation.bib"
+        if not bib_path.exists():
+            return None
+        return bib_path.read_text(encoding="utf-8")
+
     def delete_paper_dir(self, bibtex_key: str) -> bool:
         paper_dir = self.config.papers_dir / bibtex_key
         if not paper_dir.exists():

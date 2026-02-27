@@ -23,17 +23,26 @@ If the argument looks like a DOI (contains "10."), arXiv ID (like "2301.12345"),
 SSRN URL/ID, or other URL, call `ingest_paper` directly with that identifier.
 
 If the argument is a title or description, first call `find_paper` to search for it.
-Pick the best match and call `ingest_paper` with its DOI or arXiv ID.
+Pick the best match. Before ingesting, compare the match against what the user asked for:
+- Do the authors match (if the user specified authors)?
+- Is the title a close match (if the user specified a title)?
+- Is the year correct (if the user specified a year)?
+
+If any of these seem off — e.g., different authors, substantially different title,
+wrong year — show the user what you found and ask them to confirm before proceeding.
+If the match looks correct, call `ingest_paper` with its DOI or arXiv ID.
 
 If `find_paper` returns no results, use web search to find the paper, then try
-`ingest_paper` with a DOI or URL from the search results.
+`ingest_paper` with a DOI or URL from the search results. Apply the same confirmation
+check: if the web search result doesn't closely match what the user asked for, confirm
+before ingesting.
 
-## Step 2: Download the PDF
+## Step 2: Download PDF and fetch BibTeX
 
-After `ingest_paper` returns the bibtex key, **skip this step if the user provided
-a local file path** (the PDF was already provided in Step 1).
+After `ingest_paper` returns the bibtex key, **skip Tasks A and B if the user
+provided a local file path** (the PDF was already provided in Step 1).
 
-Otherwise, launch two tasks **in parallel**:
+Launch all applicable tasks **in parallel**:
 
 ### Task A: Automated download
 
@@ -53,7 +62,13 @@ For each search, scan the results for:
 
 Collect up to 3 promising PDF URLs.
 
-### After both tasks complete:
+### Task C: Fetch BibTeX citation
+
+Call `fetch_bibtex` with the bibtex key. This fetches the publisher's BibTeX entry
+via DOI content negotiation and stores it as `citation.bib`. If it fails (e.g., no
+DOI), note it in the final report but don't block the pipeline.
+
+### After Tasks A and B complete:
 
 - If Task A succeeded (status is "converting"), you're done with the PDF step.
 - If Task A failed, try each URL from Task B by calling `download_paper` with the
