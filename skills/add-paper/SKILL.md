@@ -10,6 +10,15 @@ You are adding a paper to the papertrail library. The user provided: $ARGUMENTS
 
 Follow these steps in order.
 
+## Step 0: Detect batch input
+
+If the argument contains multiple numbered citations (e.g., "1. Author (Year)..." or
+"1. Author, Title, Journal, Year" with 2+ entries), OR is a path to a `.md` file
+containing such a list, this is a **batch import**. Follow the **Batch Flow** section
+below instead of Steps 1-7.
+
+Otherwise, continue to Step 1 (single paper flow).
+
 ## Step 1: Find and ingest metadata
 
 If the argument is a **local file path** (ends in .pdf, or starts with / or ~/):
@@ -23,17 +32,26 @@ If the argument looks like a DOI (contains "10."), arXiv ID (like "2301.12345"),
 SSRN URL/ID, or other URL, call `ingest_paper` directly with that identifier.
 
 If the argument is a title or description, first call `find_paper` to search for it.
-Pick the best match and call `ingest_paper` with its DOI or arXiv ID.
+Pick the best match. Before ingesting, compare the match against what the user asked for:
+- Do the authors match (if the user specified authors)?
+- Is the title a close match (if the user specified a title)?
+- Is the year correct (if the user specified a year)?
+
+If any of these seem off — e.g., different authors, substantially different title,
+wrong year — show the user what you found and ask them to confirm before proceeding.
+If the match looks correct, call `ingest_paper` with its DOI or arXiv ID.
 
 If `find_paper` returns no results, use web search to find the paper, then try
-`ingest_paper` with a DOI or URL from the search results.
+`ingest_paper` with a DOI or URL from the search results. Apply the same confirmation
+check: if the web search result doesn't closely match what the user asked for, confirm
+before ingesting.
 
-## Step 2: Download the PDF
+## Step 2: Download PDF and fetch BibTeX
 
-After `ingest_paper` returns the bibtex key, **skip this step if the user provided
-a local file path** (the PDF was already provided in Step 1).
+After `ingest_paper` returns the bibtex key, **skip Tasks A and B if the user
+provided a local file path** (the PDF was already provided in Step 1).
 
-Otherwise, launch two tasks **in parallel**:
+Launch all applicable tasks **in parallel**:
 
 ### Task A: Automated download
 
@@ -53,7 +71,13 @@ For each search, scan the results for:
 
 Collect up to 3 promising PDF URLs.
 
-### After both tasks complete:
+### Task C: Fetch BibTeX citation
+
+Call `fetch_bibtex` with the bibtex key. This fetches the publisher's BibTeX entry
+via DOI content negotiation and stores it as `citation.bib`. If it fails (e.g., no
+DOI), note it in the final report but don't block the pipeline.
+
+### After Tasks A and B complete:
 
 - If Task A succeeded (status is "converting"), you're done with the PDF step.
 - If Task A failed, try each URL from Task B by calling `download_paper` with the
@@ -164,3 +188,70 @@ Provide a brief report to the user:
 - Main contribution (1-2 sentences)
 - Tags assigned
 - Confirmation that the paper is ready in the library
+
+---
+
+## Batch Flow
+
+This flow handles multiple citations at once. It ingests metadata and downloads PDFs
+but **skips summarization and tagging** (too expensive per paper — user can summarize
+individually later via `/read-paper`).
+
+### Phase 1: Parse citations
+
+If the input is a `.md` file path, read it first.
+
+Extract structured info from each numbered citation. For each entry, extract:
+- **Title**
+- **Authors**
+- **Year**
+- **Identifier** (DOI, SSRN URL/ID, arXiv ID) if embedded in the citation
+
+### Phase 2: Confirm with user
+
+Show the user:
+- Total number of citations parsed
+- 3-5 sample titles from the list
+- A note that summarization will be skipped (can be done later per paper)
+
+Ask them to confirm before proceeding. This catches cases where the input is
+malformed or not what the user intended.
+
+### Phase 3: Ingest in batches
+
+Process papers in **batches of 5** (to respect Semantic Scholar rate limits).
+
+For each paper in the batch:
+- If it has a DOI, SSRN ID, or arXiv ID → call `ingest_paper` directly
+- Otherwise → call `find_paper` with the title. Apply the same match-confirmation
+  logic as single-paper mode: check authors, title, and year. If the best match
+  seems off, **skip the paper** (don't prompt for each one — log it as "skipped"
+  with the reason). If the match looks correct, call `ingest_paper`.
+
+After each batch of ingestions completes, launch **in parallel** for all successfully
+ingested papers in that batch:
+- `download_paper` with the bibtex key (automated download)
+- `fetch_bibtex` with the bibtex key
+
+Track each paper's status: **ingested**, **failed** (with reason), or **skipped**
+(match looked wrong).
+
+Report progress to the user after each batch (e.g., "Batch 2/5 done: 4 ingested,
+1 skipped").
+
+### Phase 4: Report
+
+Provide a summary table of all papers:
+
+| # | Title | BibTeX Key | Status | PDF | BibTeX |
+|---|-------|------------|--------|-----|--------|
+
+Where:
+- **Status**: ingested / failed / skipped (with reason for failures and skips)
+- **PDF**: found / not found
+- **BibTeX**: fetched / not found
+
+End with a note:
+- Summarization was skipped for all papers
+- Suggest running `/read-paper` for individual papers they want to summarize
+- List any papers that need manual PDF downloads

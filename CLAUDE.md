@@ -20,10 +20,16 @@ MCP server for managing an academic paper library.
     paper.pdf
     paper.md
     summary.json                # Convenience copy
+    citation.bib                # Publisher BibTeX entry (via DOI content negotiation)
 
 ~/.cache/papertrail/
   index.db                      # Ephemeral SQLite FTS5 index
 ```
+
+## Setup
+1. `uv sync` to install dependencies
+2. `cp .mcp.json.example .mcp.json` and edit paths for your machine
+3. Configure rclone remote and set `PAPERTRAIL_RCLONE_REMOTE` in `.mcp.json`
 
 ## Development
 - Run tests: `uv run pytest`
