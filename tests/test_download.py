@@ -14,7 +14,9 @@ from papertrail.metadata import (
     DownloadResult,
     BROWSER_HEADERS,
     CLOUDFLARE_MARKERS,
+    BLOCKED_DOWNLOAD_HOSTS,
     _RateLimiter,
+    _host_is_blocked,
 )
 from papertrail.models import PaperMetadata, SearchResult
 
@@ -468,6 +470,82 @@ class TestDownloadPdf:
         assert dl.success is True
         unpaywall_attempt = [a for a in dl.attempts if "repository.edu" in a.url]
         assert len(unpaywall_attempt) == 1
+
+
+class TestHostBlocking:
+    def test_blocked_exact_host(self):
+        assert _host_is_blocked("https://www.sciencedirect.com/science/article/pii/S1234")
+        assert _host_is_blocked("https://sciencedirect.com/article/abc")
+
+    def test_blocked_subdomain(self):
+        assert _host_is_blocked("https://linkinghub.elsevier.com/retrieve/pii/S1234")
+        assert _host_is_blocked("https://onlinelibrary.wiley.com/doi/10.1234/x")
+        assert _host_is_blocked("https://link.springer.com/chapter/10.1/x")
+
+    def test_non_blocked_host(self):
+        assert not _host_is_blocked("https://arxiv.org/pdf/2301.12345")
+        assert not _host_is_blocked("https://www.nber.org/papers/w25232")
+        assert not _host_is_blocked("https://repository.edu/paper.pdf")
+        assert not _host_is_blocked("https://papers.ssrn.com/sol3/Delivery.cfm")
+
+    def test_malformed_url(self):
+        assert not _host_is_blocked("")
+        assert not _host_is_blocked("not-a-url")
+        assert not _host_is_blocked("file:///tmp/paper.pdf")
+
+    @pytest.mark.asyncio
+    async def test_blocked_url_skipped_without_http_call(self, fetcher, tmp_path):
+        """A blocked publisher URL is skipped and never fetched."""
+        result = SearchResult(
+            title="Test Paper",
+            authors=["Smith"],
+            url="https://www.sciencedirect.com/science/article/pii/S1234",
+            open_access_pdf_url="https://repository.edu/paper.pdf",
+        )
+        dest = tmp_path / "paper.pdf"
+        source_pdf = tmp_path / "source.pdf"
+        _create_test_pdf(source_pdf, "Test Paper\nSmith\nThis is a research paper about testing with enough content to pass verification checks.")
+        pdf_bytes = source_pdf.read_bytes()
+
+        with respx.mock:
+            sciencedirect_route = respx.get(url__regex=r".*sciencedirect\.com.*").mock(
+                return_value=httpx.Response(200, content=pdf_bytes, headers={"content-type": "application/pdf"})
+            )
+            respx.get("https://repository.edu/paper.pdf").mock(
+                return_value=httpx.Response(
+                    200, content=pdf_bytes,
+                    headers={"content-type": "application/pdf"},
+                )
+            )
+            dl = await fetcher.download_pdf(result, dest)
+
+        assert dl.success is True
+        assert not sciencedirect_route.called
+        blocked_attempts = [a for a in dl.attempts if "sciencedirect.com" in a.url]
+        assert len(blocked_attempts) == 1
+        assert "Skipped" in blocked_attempts[0].error
+
+    @pytest.mark.asyncio
+    async def test_blocked_subdomain_skipped(self, fetcher, tmp_path):
+        """Subdomains of blocked hosts (e.g. linkinghub.elsevier.com) are also skipped."""
+        result = SearchResult(
+            title="Test Paper",
+            authors=["Smith"],
+            open_access_pdf_url="https://linkinghub.elsevier.com/retrieve/pii/S1234",
+        )
+        dest = tmp_path / "paper.pdf"
+
+        with respx.mock:
+            elsevier_route = respx.get(url__regex=r".*elsevier\.com.*").mock(
+                return_value=httpx.Response(200)
+            )
+            dl = await fetcher.download_pdf(result, dest)
+
+        assert dl.success is False
+        assert not elsevier_route.called
+        blocked_attempts = [a for a in dl.attempts if "elsevier.com" in a.url]
+        assert len(blocked_attempts) == 1
+        assert "Skipped" in blocked_attempts[0].error
 
 
 class TestNberDetection:

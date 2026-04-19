@@ -131,6 +131,76 @@ async def _push_tags(lc: dict) -> None:
     await sync_push(lc["remote"], lc["config"].data_dir, "tags.json")
 
 
+async def _start_conversion(lc: dict, bibtex_key: str, pdf_path: Path) -> None:
+    """Flip paper to 'converting' and run PDF-to-markdown conversion in the background.
+
+    Shared by download_paper (explicit PDF registration) and the auto-download
+    background task spawned from ingest_paper.
+    """
+    db: PaperDatabase = lc["db"]
+    store: PaperStore = lc["store"]
+    converter: PdfConverter = lc["converter"]
+
+    paper = await asyncio.to_thread(store.read_paper_metadata, bibtex_key)
+    if paper is None:
+        return
+
+    paper.status = "converting"
+    await asyncio.to_thread(store.write_paper_metadata, paper)
+    await db.update_status(bibtex_key, "converting")
+    md_path = pdf_path.parent / "paper.md"
+
+    async def _run():
+        try:
+            content = await converter.convert(pdf_path, md_path)
+            await db.index_fulltext(bibtex_key, content)
+            paper.status = "summarizing"
+            await asyncio.to_thread(store.write_paper_metadata, paper)
+            await db.update_status(bibtex_key, "summarizing")
+        except Exception:
+            logger.error("Conversion failed for %s", bibtex_key, exc_info=True)
+            paper.status = "error"
+            await asyncio.to_thread(store.write_paper_metadata, paper)
+            await db.update_status(bibtex_key, "error")
+        await _push_paper(lc, bibtex_key)
+
+    asyncio.create_task(_run())
+
+
+async def _background_auto_download(lc: dict, bibtex_key: str) -> None:
+    """Run the automated PDF download pipeline in the background after ingest.
+
+    On success, kicks off conversion via _start_conversion. On failure,
+    leaves the paper in 'pending_pdf' so the find-pdfs skill and manual
+    fallbacks still work. Must never raise — spawned as a fire-and-forget
+    task.
+    """
+    try:
+        config: PapertrailConfig = lc["config"]
+        fetcher: MetadataFetcher = lc["fetcher"]
+        store: PaperStore = lc["store"]
+
+        paper = await asyncio.to_thread(store.read_paper_metadata, bibtex_key)
+        if paper is None:
+            return
+
+        paper_dir = config.papers_dir / bibtex_key
+        paper_dir.mkdir(parents=True, exist_ok=True)
+        pdf_path = paper_dir / "paper.pdf"
+
+        search_result = SearchResult.from_metadata(paper)
+        dl = await fetcher.download_pdf(search_result, pdf_path)
+        if not dl.success:
+            logger.info(
+                "Auto-download did not find a PDF for %s; remains pending_pdf", bibtex_key
+            )
+            return
+
+        await _start_conversion(lc, bibtex_key, pdf_path)
+    except Exception:
+        logger.error("Auto-download background task crashed for %s", bibtex_key, exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Paper discovery
 # ---------------------------------------------------------------------------
@@ -140,8 +210,10 @@ async def _push_tags(lc: dict) -> None:
 async def find_paper(query: str, limit: int = 10, ctx: Context = None) -> str:
     """Search for academic papers by query string.
 
-    Searches Semantic Scholar and arXiv. Returns titles, authors, years,
-    citation counts, and identifiers for matching papers.
+    Searches Semantic Scholar, arXiv, Crossref, and OpenAlex in parallel.
+    Results are deduplicated by DOI / arXiv ID / normalized title with
+    Semantic Scholar preferred. Returns titles, authors, years, citation
+    counts, and identifiers for matching papers.
 
     Args:
         query: Search terms (e.g., "causal inference machine learning")
@@ -179,47 +251,23 @@ async def find_paper(query: str, limit: int = 10, ctx: Context = None) -> str:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
-async def ingest_paper(identifier: str, ctx: Context = None) -> str:
-    """Fetch metadata for a paper and save it to the library.
+async def _save_search_result_as_paper(
+    lc: dict, result: SearchResult, auto_download: bool
+) -> str:
+    """Generate a bibtex key, persist the paper, and optionally start auto-download.
 
-    Accepts a DOI, arXiv ID, SSRN ID/URL, or paper URL. Saves metadata and
-    generates a BibTeX key. Does NOT download the PDF — call download_paper
-    separately to fetch or provide the PDF.
-
-    Args:
-        identifier: DOI (e.g., "10.1257/aer.2024.001"), arXiv ID (e.g., "2301.12345"),
-                    SSRN URL/ID, or direct paper URL
+    Shared by ingest_paper (metadata-lookup path) and ingest_paper_manual
+    (user-provided metadata path). Returns the user-facing response string.
     """
-    lc = _get_context(ctx)
-    await _ensure_synced(lc)
     db: PaperDatabase = lc["db"]
     config: PapertrailConfig = lc["config"]
     fetcher: MetadataFetcher = lc["fetcher"]
     store: PaperStore = lc["store"]
 
-    # 1. Look up metadata
-    result = await fetcher.get_by_identifier(identifier)
-
-    # Fallback for SSRN if Semantic Scholar doesn't have it
-    if result is None:
-        import re
-        ssrn_match = re.search(r"(?:abstract=|^)(\d{5,})", identifier)
-        if ssrn_match:
-            ssrn_id = ssrn_match.group(1)
-            result = await fetcher.get_crossref_metadata(f"10.2139/ssrn.{ssrn_id}")
-            if result is None:
-                result = await fetcher.get_ssrn_metadata(ssrn_id)
-
-    if result is None:
-        return f"Could not find paper with identifier: {identifier}. Try using find_paper to search by title."
-
-    # 2. Generate unique bibtex key
     bibtex_key = await fetcher.generate_unique_key(result, db, store)
     paper_dir = config.papers_dir / bibtex_key
     paper_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3. Create paper metadata
     paper = PaperMetadata(
         bibtex_key=bibtex_key,
         title=result.title,
@@ -237,19 +285,143 @@ async def ingest_paper(identifier: str, ctx: Context = None) -> str:
         status="pending_pdf",
     )
 
-    # 4. Write JSON source of truth, then update index
     await asyncio.to_thread(store.write_paper_metadata, paper)
     await db.upsert_paper(paper)
     await _push_paper(lc, bibtex_key)
 
-    return (
+    header = (
         f"Paper metadata saved as **{bibtex_key}**\n\n"
         f"- Title: {result.title}\n"
         f"- Authors: {', '.join(result.authors)}\n"
         f"- Year: {result.year}\n"
-        f"- Status: pending_pdf\n\n"
-        f"Call `download_paper(\"{bibtex_key}\")` to download the PDF."
     )
+
+    if auto_download:
+        asyncio.create_task(_background_auto_download(lc, bibtex_key))
+        return (
+            header
+            + f"- Status: pending_pdf (PDF download running in background)\n\n"
+            f"**NEXT STEP (required):** Poll `conversion_status(\"{bibtex_key}\")` "
+            f"every 10s until status is 'summarizing' or 'error'. Then read the "
+            f"paper with `read_paper` and call `store_summary`. If status stays "
+            f"'pending_pdf' after a minute, the auto-download failed — call "
+            f"`download_paper(\"{bibtex_key}\", pdf_url=...)` with a URL you find."
+        )
+
+    return (
+        header
+        + f"- Status: pending_pdf\n\n"
+        f"**NEXT STEP (required):** Call `download_paper(\"{bibtex_key}\")` to "
+        f"fetch the PDF (or pass `pdf_url=`/`pdf_source_path=`), then poll "
+        f"`conversion_status` and call `store_summary` once ready."
+    )
+
+
+@mcp.tool()
+async def ingest_paper(
+    identifier: str,
+    auto_download: bool = True,
+    ctx: Context = None,
+) -> str:
+    """Fetch metadata for a paper and save it to the library.
+
+    When auto_download=True (default), kicks off the PDF download and
+    conversion pipeline in the background immediately after saving metadata.
+    Returns right away with the bibtex key; poll conversion_status to track
+    progress and call store_summary once status is 'summarizing'.
+
+    Set auto_download=False if you plan to provide a pdf_url/pdf_source_path
+    manually or orchestrate PDF discovery in parallel (e.g. find-pdfs skill).
+
+    If the identifier cannot be found in any index (Semantic Scholar, Crossref,
+    OpenAlex, SSRN), this tool fails. For working papers or unindexed drafts,
+    use `ingest_paper_manual` with title/authors provided directly.
+
+    Args:
+        identifier: DOI (e.g., "10.1257/aer.2024.001"), arXiv ID (e.g., "2301.12345"),
+                    SSRN URL/ID, or direct paper URL
+        auto_download: If True, start automated PDF download in the background (default True)
+    """
+    lc = _get_context(ctx)
+    await _ensure_synced(lc)
+    fetcher: MetadataFetcher = lc["fetcher"]
+
+    result = await fetcher.get_by_identifier(identifier)
+
+    # Fallback for SSRN if Semantic Scholar doesn't have it
+    if result is None:
+        import re
+        ssrn_match = re.search(r"(?:abstract=|^)(\d{5,})", identifier)
+        if ssrn_match:
+            ssrn_id = ssrn_match.group(1)
+            result = await fetcher.get_crossref_metadata(f"10.2139/ssrn.{ssrn_id}")
+            if result is None:
+                result = await fetcher.get_ssrn_metadata(ssrn_id)
+
+    if result is None:
+        return (
+            f"Could not find paper with identifier: {identifier}.\n\n"
+            f"Options:\n"
+            f"- Use `find_paper` to search by title across Semantic Scholar, arXiv, "
+            f"Crossref, and OpenAlex.\n"
+            f"- For working papers or unindexed drafts, call `ingest_paper_manual` "
+            f"with title and authors provided directly."
+        )
+
+    return await _save_search_result_as_paper(lc, result, auto_download)
+
+
+@mcp.tool()
+async def ingest_paper_manual(
+    title: str,
+    authors: list[str],
+    year: int | None = None,
+    abstract: str | None = None,
+    url: str | None = None,
+    doi: str | None = None,
+    auto_download: bool = False,
+    ctx: Context = None,
+) -> str:
+    """Save a paper to the library using user-provided metadata.
+
+    Use this for working papers, conference drafts, or other unindexed
+    documents that `ingest_paper` cannot find. Skips metadata lookup entirely
+    and creates a paper directly from the supplied title and authors.
+
+    After this call, provide the PDF by calling `download_paper` with either
+    `pdf_source_path=` (local file) or `pdf_url=` (direct PDF link, e.g. an
+    author's website). Automated discovery usually won't succeed for working
+    papers, so `auto_download` defaults to False here.
+
+    Args:
+        title: Full paper title
+        authors: List of author names (e.g., ["John Smith", "Jane Doe"])
+        year: Publication or working paper year (optional)
+        abstract: Abstract text (optional)
+        url: Paper URL, e.g. an author's page or working paper series link (optional)
+        doi: DOI if the paper has one, even if unindexed (optional)
+        auto_download: If True and a URL is provided, try to download from it.
+                       Default False — most working papers need manual PDF provision.
+    """
+    lc = _get_context(ctx)
+    await _ensure_synced(lc)
+
+    if not title or not title.strip():
+        return "Title is required."
+    if not authors:
+        return "At least one author is required."
+
+    result = SearchResult(
+        title=title.strip(),
+        authors=[a.strip() for a in authors if a and a.strip()],
+        year=year,
+        abstract=abstract,
+        url=url,
+        doi=doi,
+        source="manual",
+    )
+
+    return await _save_search_result_as_paper(lc, result, auto_download)
 
 
 @mcp.tool()
@@ -370,27 +542,7 @@ async def download_paper(
             f"Provide a pdf_url, pdf_source_path, or omit both to try automated download."
         )
 
-    # Start conversion
-    paper.status = "converting"
-    await asyncio.to_thread(store.write_paper_metadata, paper)
-    await db.update_status(bibtex_key, "converting")
-    md_path = paper_dir / "paper.md"
-
-    async def background_convert():
-        try:
-            content = await converter.convert(pdf_path, md_path)
-            await db.index_fulltext(bibtex_key, content)
-            paper.status = "summarizing"
-            await asyncio.to_thread(store.write_paper_metadata, paper)
-            await db.update_status(bibtex_key, "summarizing")
-        except Exception:
-            logger.error("Conversion failed for %s", bibtex_key, exc_info=True)
-            paper.status = "error"
-            await asyncio.to_thread(store.write_paper_metadata, paper)
-            await db.update_status(bibtex_key, "error")
-        await _push_paper(lc, bibtex_key)
-
-    asyncio.create_task(background_convert())
+    await _start_conversion(lc, bibtex_key, pdf_path)
 
     return (
         f"PDF registered for **{bibtex_key}**. Converting to markdown in the background.\n"

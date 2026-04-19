@@ -1,6 +1,6 @@
 ---
 name: add-paper
-description: Add an academic paper to the papertrail library. Accepts a DOI, arXiv ID, SSRN URL, paper URL, or title search. Runs the full pipeline: find, download, convert, summarize, tag, and store.
+description: Add an academic paper to the papertrail library. Accepts a DOI, arXiv ID, SSRN URL, paper URL, title search, or unindexed working paper (user-provided metadata). Runs the full pipeline: find, download, convert, summarize, tag, and store.
 context: fork
 ---
 
@@ -15,7 +15,10 @@ Follow these steps in order.
 If the argument is a **local file path** (ends in .pdf, or starts with / or ~/):
 1. Extract the paper title from the filename (strip author prefixes, underscores, extensions)
 2. Call `find_paper` with the title to find the paper's DOI or arXiv ID
-3. Call `ingest_paper` with the identifier (saves metadata only)
+3. Call `ingest_paper` with the identifier **and `auto_download=False`** (we already
+   have the PDF — don't race with auto-download).
+   If `find_paper` returns nothing and `ingest_paper` has no identifier to look up,
+   fall back to `ingest_paper_manual` (see the "Working papers" section below).
 4. Then call `download_paper` with the bibtex key and `pdf_source_path` set to the
    absolute path of the local file
 
@@ -28,40 +31,69 @@ Pick the best match and call `ingest_paper` with its DOI or arXiv ID.
 If `find_paper` returns no results, use web search to find the paper, then try
 `ingest_paper` with a DOI or URL from the search results.
 
-## Step 2: Download the PDF
+### Working papers and unindexed drafts
 
-After `ingest_paper` returns the bibtex key, **skip this step if the user provided
-a local file path** (the PDF was already provided in Step 1).
+If `ingest_paper` fails with "Could not find paper with identifier" — common
+for author-website working papers, recent conference drafts, technical reports,
+and other unindexed documents — fall back to `ingest_paper_manual`:
 
-Otherwise, launch two tasks **in parallel**:
+- Confirm the title and author list with the user if you only have a URL or
+  filename. The user typically knows these off the top of their head, or they
+  are visible on the paper's landing page.
+- Call `ingest_paper_manual(title=..., authors=[...], year=..., url=...)`
+  with the paper URL (if known) so it can serve as a `pdf_url` fallback later.
+- Then call `download_paper` with `pdf_url` (author website) or
+  `pdf_source_path` (local file) to supply the PDF.
 
-### Task A: Automated download
+`ingest_paper` (with the default `auto_download=True`) kicks off automated PDF
+download in the background. You do NOT need to call `download_paper` first — it
+will run itself. `ingest_paper_manual` does NOT auto-download by default, since
+working papers typically need a specific user-provided URL or file.
 
-Call `download_paper` with the bibtex key (no pdf_url or pdf_source_path). This runs
-the full automated pipeline (arXiv, NBER, Unpaywall, institutional repos, etc.).
+## Step 2: Find candidate PDFs while auto-download runs
 
-### Task B: Web search for PDF
+**Skip this step if the user provided a local file path** — the PDF is already in
+place from Step 1.
 
-Use WebSearch to find a freely available PDF. Try these queries:
+**If you took the `ingest_paper_manual` path** (working paper / unindexed draft):
+auto-download is NOT running. If you provided a `url=` that points directly at a
+PDF, call `download_paper(bibtex_key, pdf_url=<url>)` now and skip the WebSearch
+below unless that call fails. Otherwise, jump straight into the WebSearch
+collection below and call `download_paper(bibtex_key, pdf_url=...)` with each
+candidate until one succeeds.
+
+**Otherwise** (normal `ingest_paper` path): auto-download is running in the
+background. Use WebSearch to collect backup PDF URLs in case auto-download
+fails. Try these queries:
 1. "{paper title}" filetype:pdf
 2. "{first author last name}" "{first few title words}" PDF
 
 For each search, scan the results for:
 - Direct PDF links (ending in .pdf or from known repositories)
-- Author faculty/personal websites (these often host working paper PDFs)
-- Institutional repositories (repec.org, nber.org, econstor.eu, etc.)
+- Author faculty/personal websites (.edu, .ac.uk often host working paper PDFs)
+- Institutional repositories (repec.org, nber.org, econstor.eu, dash.harvard.edu, etc.)
+- Conference proceedings (aeaweb.org, neurips.cc, iclr.cc, etc.)
+- Preprint servers (arxiv.org, osf.io)
+
+**Do NOT collect URLs from these hosts** — they reliably block automated
+downloads and `download_paper` will skip them:
+sciencedirect.com, linkinghub.elsevier.com, elsevier.com,
+onlinelibrary.wiley.com, wiley.com, link.springer.com, springer.com,
+springerlink.com, tandfonline.com, jstor.org, academic.oup.com,
+researchgate.net.
 
 Collect up to 3 promising PDF URLs.
 
-### After both tasks complete:
+### After collecting URLs
 
-- If Task A succeeded (status is "converting"), you're done with the PDF step.
-- If Task A failed, try each URL from Task B by calling `download_paper` with the
-  bibtex key and `pdf_url` set to the URL. Stop as soon as one succeeds.
+Call `conversion_status` with the bibtex key:
+- If status is `converting` or `summarizing`, auto-download worked — proceed to Step 3.
+- If status is still `pending_pdf`, auto-download failed. Try each URL you
+  collected by calling `download_paper` with the bibtex key and `pdf_url`. Stop
+  as soon as one succeeds.
 - If all URLs fail, ask the user to download the PDF manually and tell them
-  the path to place it at (`~/.papertrail/papers/{bibtex_key}/paper.pdf`).
-- Once the user places the PDF, call `download_paper` with the bibtex key and
-  `pdf_source_path` to continue.
+  the path to place it at (`~/.papertrail/papers/{bibtex_key}/paper.pdf`), then
+  call `download_paper` with the bibtex key and `pdf_source_path`.
 
 ## Step 3: Wait for conversion
 

@@ -5,6 +5,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
@@ -55,6 +56,40 @@ CLOUDFLARE_MARKERS = [
 ]
 
 NBER_WP_PATTERN = re.compile(r"/working_papers/(w\d+)|nber\.org/papers/(w\d+)")
+
+BLOCKED_DOWNLOAD_HOSTS = frozenset({
+    "sciencedirect.com",
+    "linkinghub.elsevier.com",
+    "elsevier.com",
+    "onlinelibrary.wiley.com",
+    "wiley.com",
+    "link.springer.com",
+    "springer.com",
+    "springerlink.com",
+    "tandfonline.com",
+    "jstor.org",
+    "www.jstor.org",
+    "researchgate.net",
+    "www.researchgate.net",
+    "academic.oup.com",
+})
+
+
+def _host_is_blocked(url: str) -> bool:
+    """Check whether a URL's host is known to block automated PDF downloads."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if host in BLOCKED_DOWNLOAD_HOSTS:
+        return True
+    parts = host.split(".")
+    for i in range(1, len(parts)):
+        if ".".join(parts[i:]) in BLOCKED_DOWNLOAD_HOSTS:
+            return True
+    return False
 
 
 @dataclass
@@ -117,10 +152,14 @@ class MetadataFetcher:
         )
 
     async def search(self, query: str, limit: int = 10) -> list[SearchResult]:
-        """Search Semantic Scholar and arXiv, merge and deduplicate results."""
-        ss_results = await self._search_semantic_scholar(query, limit)
-        arxiv_results = await self._search_arxiv(query, limit)
-        combined = ss_results + arxiv_results
+        """Search Semantic Scholar, arXiv, Crossref, and OpenAlex in parallel."""
+        ss_results, arxiv_results, crossref_results, openalex_results = await asyncio.gather(
+            self._search_semantic_scholar(query, limit),
+            self._search_arxiv(query, limit),
+            self._search_crossref(query, limit),
+            self._search_openalex(query, limit),
+        )
+        combined = ss_results + arxiv_results + crossref_results + openalex_results
         return self._deduplicate(combined)[:limit]
 
     async def get_by_identifier(self, identifier: str) -> SearchResult | None:
@@ -359,6 +398,12 @@ class MetadataFetcher:
         7. Unpaywall (finds legal open access copies)
         8. DOI redirect (works through institutional VPN/proxy)
         9. SSRN direct download (often Cloudflare-blocked)
+
+        URLs on BLOCKED_DOWNLOAD_HOSTS (Elsevier, Wiley, Springer, etc.) are
+        skipped without issuing an HTTP request — these publishers reliably
+        block automated downloads and waste seconds per attempt. The skipped
+        URLs are still recorded in DownloadResult.attempts so callers can
+        retry them manually via download_paper(pdf_url=...).
         """
         from papertrail.converter import verify_pdf_content
 
@@ -417,6 +462,10 @@ class MetadataFetcher:
 
         for url in urls_to_try:
             attempt = DownloadAttempt(url=url)
+            if _host_is_blocked(url):
+                attempt.error = "Skipped: host known to block automated downloads"
+                download_result.attempts.append(attempt)
+                continue
             try:
                 response = await self._download_get(url)
                 attempt.status_code = response.status_code
@@ -599,6 +648,50 @@ class MetadataFetcher:
             logger.warning("arXiv search failed: %s", exc)
             return []
 
+    async def _search_crossref(self, query: str, limit: int) -> list[SearchResult]:
+        """Search Crossref for papers by title/keywords."""
+        params: dict = {"query": query, "rows": min(limit, 20)}
+        if self.unpaywall_email:
+            params["mailto"] = self.unpaywall_email
+        try:
+            response = await self.client.get(
+                CROSSREF_BASE,
+                params=params,
+                headers={"Accept": "application/json"},
+            )
+            if response.status_code != 200:
+                return []
+            items = response.json().get("message", {}).get("items", [])
+            results = []
+            for item in items:
+                parsed = self._parse_crossref_result(item)
+                if parsed is not None:
+                    results.append(parsed)
+            return results
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            logger.warning("Crossref search failed: %s", exc)
+            return []
+
+    async def _search_openalex(self, query: str, limit: int) -> list[SearchResult]:
+        """Search OpenAlex for papers by title/keywords."""
+        params: dict = {"search": query, "per_page": min(limit, 25)}
+        if self.unpaywall_email:
+            params["mailto"] = self.unpaywall_email
+        try:
+            response = await self.client.get(OPENALEX_BASE, params=params)
+            if response.status_code != 200:
+                return []
+            items = response.json().get("results", [])
+            results = []
+            for item in items:
+                parsed = self._parse_openalex_result(item)
+                if parsed is not None:
+                    results.append(parsed)
+            return results
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            logger.warning("OpenAlex search failed: %s", exc)
+            return []
+
     async def _ss_get(self, path: str) -> dict | None:
         """Make a GET request to Semantic Scholar and return JSON or None."""
         try:
@@ -758,24 +851,88 @@ class MetadataFetcher:
             ))
         return results
 
+    def _parse_openalex_result(self, data: dict) -> SearchResult | None:
+        """Parse an OpenAlex Work record into a SearchResult."""
+        title = data.get("title") or data.get("display_name")
+        if not title:
+            return None
+
+        authors = []
+        for authorship in data.get("authorships", []) or []:
+            author = authorship.get("author") or {}
+            name = author.get("display_name")
+            if name:
+                authors.append(name)
+
+        doi = data.get("doi")
+        if doi and doi.lower().startswith("https://doi.org/"):
+            doi = doi[len("https://doi.org/"):]
+
+        abstract = None
+        inv_idx = data.get("abstract_inverted_index")
+        if inv_idx:
+            positions: list[tuple[int, str]] = []
+            for word, idxs in inv_idx.items():
+                for i in idxs:
+                    positions.append((i, word))
+            if positions:
+                positions.sort()
+                abstract = " ".join(word for _, word in positions)
+
+        oa = data.get("open_access") or {}
+        oa_url = oa.get("oa_url")
+
+        return SearchResult(
+            title=title,
+            authors=authors,
+            year=data.get("publication_year"),
+            abstract=abstract,
+            doi=doi,
+            url=data.get("id"),
+            citation_count=data.get("cited_by_count"),
+            open_access_pdf_url=oa_url,
+            source="openalex",
+        )
+
     def _deduplicate(self, results: list[SearchResult]) -> list[SearchResult]:
-        """Deduplicate results by DOI or arXiv ID, preferring Semantic Scholar."""
+        """Deduplicate results by DOI, arXiv ID, or normalized title.
+
+        Source priority (SS > arXiv > Crossref > OpenAlex > SSRN) determines
+        which source's record is kept when duplicates are found.
+        """
+        source_priority = {
+            "semantic_scholar": 0,
+            "arxiv": 1,
+            "crossref": 2,
+            "openalex": 3,
+            "ssrn": 4,
+        }
+        sorted_results = sorted(
+            results, key=lambda r: source_priority.get(r.source, 99)
+        )
+
         seen_dois: set[str] = set()
         seen_arxiv: set[str] = set()
+        seen_titles: set[str] = set()
         unique = []
 
-        # Sort so semantic_scholar comes first
-        sorted_results = sorted(results, key=lambda r: 0 if r.source == "semantic_scholar" else 1)
-
         for result in sorted_results:
-            if result.doi and result.doi in seen_dois:
+            doi_key = result.doi.lower() if result.doi else None
+            title_key = re.sub(r"[^a-z0-9]", "", (result.title or "").lower())
+
+            if doi_key and doi_key in seen_dois:
                 continue
             if result.arxiv_id and result.arxiv_id in seen_arxiv:
                 continue
-            if result.doi:
-                seen_dois.add(result.doi)
+            if not doi_key and not result.arxiv_id and title_key and title_key in seen_titles:
+                continue
+
+            if doi_key:
+                seen_dois.add(doi_key)
             if result.arxiv_id:
                 seen_arxiv.add(result.arxiv_id)
+            if title_key:
+                seen_titles.add(title_key)
             unique.append(result)
         return unique
 

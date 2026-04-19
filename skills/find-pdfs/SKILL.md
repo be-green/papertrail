@@ -42,12 +42,17 @@ Each subagent prompt should be (fill in bibtex_key, title, authors, year, doi):
 >
 > For each search, look for:
 > - **Direct PDF links**: URLs ending in .pdf or containing /pdf/
-> - **Author websites**: Faculty pages at universities often host working papers
-> - **Institutional repositories**: repec.org, econstor.eu, nber.org, ideas.repec.org
-> - **Conference proceedings**: ASSA, NBER Summer Institute, CEPR, etc.
-> - **Preprint servers**: arXiv, SSRN, OSF
+> - **Author websites**: Faculty pages at universities (.edu, .ac.uk) often host working papers
+> - **Institutional repositories**: repec.org, econstor.eu, nber.org, ideas.repec.org, dash.harvard.edu, scholar.princeton.edu
+> - **Conference proceedings**: aeaweb.org, neurips.cc, iclr.cc, ASSA, NBER Summer Institute, CEPR
+> - **Preprint servers**: arxiv.org, ssrn.com (author-posted version), osf.io
 >
-> Prefer author website and institutional repository PDFs over ResearchGate.
+> **Do NOT return URLs from these hosts** — they reliably block automated
+> downloads and `download_paper` will skip them:
+> sciencedirect.com, linkinghub.elsevier.com, elsevier.com,
+> onlinelibrary.wiley.com, wiley.com, link.springer.com, springer.com,
+> springerlink.com, tandfonline.com, jstor.org, academic.oup.com,
+> researchgate.net.
 >
 > ## Download attempts
 >
