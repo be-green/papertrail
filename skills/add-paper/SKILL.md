@@ -169,7 +169,11 @@ the bibtex key):
 
 ### Task B — Main agent: Fetch the tag vocabulary
 
-While the subagent is running, call `list_tags` to retrieve the current tag vocabulary.
+While the subagent is running, call `list_tags` to retrieve the current tag
+vocabulary. The output is grouped into a `## Fields` section (broad
+disciplines like `finance`, `macroeconomics`) and a `## Concepts` section
+(narrower methods and subfields like `term-structure`, `causal-inference`).
+Every paper should be assigned both kinds.
 
 ## Step 5: Handle wrong document
 
@@ -182,19 +186,26 @@ If the subagent returned `WRONG_DOCUMENT`, report the issue to the user:
 
 Once the subagent returns the summary and keywords, and you have the tag vocabulary:
 
-### 6a. Prefer existing tags
+### 6a. Pick 1–2 fields, then 2–5 concepts
 
-Read the vocabulary carefully. For each topic the paper covers, pick the best
-existing tag rather than minting a new one. The vocabulary is sorted by paper
-count — high-count tags are well-established and should be reused whenever
-they're a reasonable fit.
+Every paper needs **exactly 1 or 2 field tags** (from the `## Fields` section)
+and **2–5 concept tags** (from the `## Concepts` section). Two field tags are
+appropriate for genuinely cross-disciplinary work (e.g. macro-finance papers
+get `macroeconomics` + `finance`); one is typical.
 
-Rules of thumb:
+For both kinds, prefer existing tags over minting new ones. The vocabulary
+sections are sorted by paper count — high-count tags are well-established and
+should be reused whenever they're a reasonable fit.
+
+Rules of thumb for new-tag creation:
 - If an existing tag with **≥3 papers** plausibly covers a topic, use it. Do
   not invent a finer-grained alternative.
 - Cap new tags at **1 per paper** unless the paper genuinely opens a new area
   that no existing tag can cover. In that case, still aim for a single,
   broader new tag rather than several narrow ones.
+- New **field** tags are rare and should only be created when the paper is
+  the first representative of a whole discipline not already represented.
+  When adding a field, pass `"kind": "field"` in the `add_tags` JSON.
 - Prefer generic names over paper-specific ones. "term-structure" beats
   "affine-term-structure-with-quadratic-drift".
 

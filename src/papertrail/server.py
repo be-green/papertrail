@@ -780,26 +780,47 @@ async def search_paper_text(query: str, limit: int = 10, ctx: Context = None) ->
 async def list_papers(
     status: str | None = None,
     tag: str | None = None,
+    field: str | None = None,
     limit: int = 50,
     ctx: Context = None,
 ) -> str:
-    """List papers in the library, optionally filtered by status or tag.
+    """List papers in the library, optionally filtered by status, field, or tag.
+
+    `field` and `tag` compose as AND — e.g. `field="finance"` with
+    `tag="term-structure"` returns finance papers that also carry the
+    term-structure concept. `field` requires the name to refer to a tag of
+    kind='field' (use `list_tags(kind="field")` to see the options).
+
+    Paper tags in the output are rendered as
+    `[field1, field2 | concept1, concept2]` so the reader can tell fields
+    from concepts at a glance.
 
     Args:
         status: Filter by status (downloading, converting, summarizing, ready, error)
-        tag: Filter by tag name
+        tag: Filter by tag name (any kind)
+        field: Filter by field tag name (tag must have kind='field')
         limit: Maximum number of papers to return (default 50)
     """
     lc = _get_context(ctx)
     await _ensure_synced(lc)
     db: PaperDatabase = lc["db"]
-    papers = await db.list_papers(status=status, tag=tag, limit=limit)
+    papers = await db.list_papers(status=status, tag=tag, field=field, limit=limit)
     if not papers:
         return "No papers found in the library."
+    vocab_kinds = {t.tag: t.kind for t in await db.list_tags()}
     lines = []
     for paper in papers:
         paper_tags = await db.get_paper_tags(paper.bibtex_key)
-        tags_str = f" [{', '.join(paper_tags)}]" if paper_tags else ""
+        fields = [t for t in paper_tags if vocab_kinds.get(t) == "field"]
+        concepts = [t for t in paper_tags if vocab_kinds.get(t) != "field"]
+        if fields and concepts:
+            tags_str = f" [{', '.join(fields)} | {', '.join(concepts)}]"
+        elif fields:
+            tags_str = f" [{', '.join(fields)}]"
+        elif concepts:
+            tags_str = f" [{', '.join(concepts)}]"
+        else:
+            tags_str = ""
         citation = _format_citation(paper)
         lines.append(
             f"- **{citation}**: {paper.title}{tags_str} `{paper.bibtex_key}` [{paper.status}]"
@@ -813,23 +834,52 @@ async def list_papers(
 
 
 @mcp.tool()
-async def list_tags(prefix: str | None = None, ctx: Context = None) -> str:
-    """Return all tags in the vocabulary with paper counts.
+async def list_tags(
+    prefix: str | None = None,
+    kind: str | None = None,
+    ctx: Context = None,
+) -> str:
+    """Return tags in the vocabulary with paper counts.
+
+    When `kind` is None (default), the output is grouped into a `## Fields`
+    section followed by a `## Concepts` section, each sorted by paper count.
+    When `kind` is specified ("field" or "concept"), output is a flat filtered
+    list.
+
+    Fields are broad disciplines (e.g. `finance`, `macroeconomics`). Concepts
+    are narrower methods or subfields (e.g. `term-structure`,
+    `causal-inference`). Every paper should carry 1-2 fields + a few concepts.
 
     Args:
-        prefix: Optional prefix to filter tags (e.g., "climate" returns "climate-risk", "climate-finance", etc.)
+        prefix: Optional prefix to filter tags by name (e.g., "climate")
+        kind: Optional kind filter — "field" or "concept"
     """
     lc = _get_context(ctx)
     await _ensure_synced(lc)
     db: PaperDatabase = lc["db"]
-    tags = await db.list_tags(prefix=prefix)
+    tags = await db.list_tags(prefix=prefix, kind=kind)
     if not tags:
         return "No tags in the vocabulary yet."
-    lines = []
-    for tag in tags:
+
+    def render(tag) -> str:
         desc = f" - {tag.description}" if tag.description else ""
-        lines.append(f"- **{tag.tag}** ({tag.paper_count} papers){desc}")
-    return "\n".join(lines)
+        return f"- **{tag.tag}** ({tag.paper_count} papers){desc}"
+
+    if kind is not None:
+        return "\n".join(render(t) for t in tags)
+
+    fields = [t for t in tags if t.kind == "field"]
+    concepts = [t for t in tags if t.kind != "field"]
+    sections: list[str] = []
+    if fields:
+        sections.append(
+            "## Fields\n" + "\n".join(render(t) for t in fields)
+        )
+    if concepts:
+        sections.append(
+            "## Concepts\n" + "\n".join(render(t) for t in concepts)
+        )
+    return "\n\n".join(sections)
 
 
 @mcp.tool()
@@ -842,9 +892,15 @@ async def add_tags(tags: str, ctx: Context = None) -> str:
     listing the similar existing tags so you can reconsider before tagging a
     paper with the new one.
 
+    Each tag object may include `"kind": "field" | "concept"` — defaults to
+    "concept". Fields are broad disciplines; concepts are narrower methods or
+    subfields. Most new additions should be concepts.
+
     Args:
-        tags: JSON array of objects with 'tag' (required) and 'description' (optional).
-              Example: [{"tag": "causal-inference", "description": "Papers using causal methods"}]
+        tags: JSON array of objects with 'tag' (required), 'description' (optional),
+              and 'kind' (optional, defaults to "concept").
+              Example: [{"tag": "causal-inference", "description": "..."},
+                        {"tag": "micro-theory", "description": "...", "kind": "field"}]
     """
     lc = _get_context(ctx)
     db: PaperDatabase = lc["db"]
@@ -857,6 +913,13 @@ async def add_tags(tags: str, ctx: Context = None) -> str:
 
     if not isinstance(tag_list, list):
         return "Expected a JSON array of tag objects."
+
+    for entry in tag_list:
+        if entry.get("kind") not in (None, "field", "concept"):
+            return (
+                f"Invalid kind for '{entry.get('tag')}': "
+                f"must be 'field' or 'concept'."
+            )
 
     existing_tags = await asyncio.to_thread(store.read_tags)
     existing_tag_names = {t["tag"] for t in existing_tags}
@@ -872,7 +935,9 @@ async def add_tags(tags: str, ctx: Context = None) -> str:
         if name in existing_tag_names:
             skipped_duplicates.append(name)
             continue
-        existing_tags.append(new_tag)
+        entry = dict(new_tag)
+        entry.setdefault("kind", "concept")
+        existing_tags.append(entry)
         existing_tag_names.add(name)
         added.append(name)
         matches = similar_tags(name, vocabulary_names)
@@ -1243,6 +1308,37 @@ async def prune_tags(dry_run: bool = True, ctx: Context = None) -> str:
     await db.delete_tags_from_vocab(orphans)
     await _push_tags(lc)
     return f"Pruned {len(orphans)} orphan tag(s): {', '.join(orphans)}"
+
+
+@mcp.tool()
+async def set_tag_kind(tag: str, kind: str, ctx: Context = None) -> str:
+    """Promote a concept tag to a field (or demote a field to a concept).
+
+    Fields are broad disciplines used to group concepts; concepts are the
+    narrower method/subfield labels that sit underneath a field. Both kinds
+    live in the same `tags` table, distinguished only by this attribute.
+
+    Args:
+        tag: Existing tag name
+        kind: Either "field" or "concept"
+    """
+    if kind not in {"field", "concept"}:
+        return "kind must be 'field' or 'concept'."
+
+    lc = _get_context(ctx)
+    await _ensure_synced(lc)
+    db: PaperDatabase = lc["db"]
+    store: PaperStore = lc["store"]
+
+    vocab_changed = await asyncio.to_thread(
+        store.set_tag_kind_in_vocab, tag, kind
+    )
+    db_changed = await db.set_tag_kind(tag, kind)
+    if not db_changed and not vocab_changed:
+        return f"Tag '{tag}' is not in the vocabulary."
+    if vocab_changed:
+        await _push_tags(lc)
+    return f"Set '{tag}' to kind='{kind}'."
 
 
 # ---------------------------------------------------------------------------

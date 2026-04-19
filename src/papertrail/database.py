@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS papers (
 CREATE TABLE IF NOT EXISTS tags (
     tag TEXT PRIMARY KEY,
     description TEXT,
+    kind TEXT NOT NULL DEFAULT 'concept',
     paper_count INTEGER DEFAULT 0
 );
 
@@ -94,8 +95,12 @@ class PaperDatabase:
         # Bulk insert tags
         for tag_data in tags:
             conn.execute(
-                "INSERT OR IGNORE INTO tags (tag, description, paper_count) VALUES (?, ?, 0)",
-                (tag_data["tag"], tag_data.get("description")),
+                "INSERT OR IGNORE INTO tags (tag, description, kind, paper_count) VALUES (?, ?, ?, 0)",
+                (
+                    tag_data["tag"],
+                    tag_data.get("description"),
+                    tag_data.get("kind", "concept"),
+                ),
             )
 
         # Bulk insert papers and FTS entries
@@ -248,41 +253,50 @@ class PaperDatabase:
         self,
         status: str | None = None,
         tag: str | None = None,
+        field: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[PaperMetadata]:
-        return await asyncio.to_thread(self._sync_list_papers, status, tag, limit, offset)
+        return await asyncio.to_thread(
+            self._sync_list_papers, status, tag, field, limit, offset
+        )
 
     def _sync_list_papers(
         self,
         status: str | None,
         tag: str | None,
+        field: str | None,
         limit: int,
         offset: int,
     ) -> list[PaperMetadata]:
         conn = self._ensure_connection()
+        joins: list[str] = []
+        where: list[str] = []
+        params: list = []
         if tag:
-            query = """
-                SELECT p.* FROM papers p
-                JOIN paper_tags pt ON p.bibtex_key = pt.bibtex_key
-                WHERE pt.tag = ?
-            """
-            params: list = [tag]
-            if status:
-                query += " AND p.status = ?"
-                params.append(status)
-            query += " ORDER BY p.year DESC LIMIT ? OFFSET ?"
-            params.extend([limit, offset])
-            rows = conn.execute(query, params).fetchall()
-        else:
-            query = "SELECT * FROM papers"
-            params = []
-            if status:
-                query += " WHERE status = ?"
-                params.append(status)
-            query += " ORDER BY year DESC LIMIT ? OFFSET ?"
-            params.extend([limit, offset])
-            rows = conn.execute(query, params).fetchall()
+            joins.append(
+                "JOIN paper_tags pt_tag ON p.bibtex_key = pt_tag.bibtex_key"
+            )
+            where.append("pt_tag.tag = ?")
+            params.append(tag)
+        if field:
+            joins.append(
+                "JOIN paper_tags pt_field ON p.bibtex_key = pt_field.bibtex_key "
+                "JOIN tags t_field ON pt_field.tag = t_field.tag"
+            )
+            where.append("pt_field.tag = ? AND t_field.kind = 'field'")
+            params.append(field)
+        if status:
+            where.append("p.status = ?")
+            params.append(status)
+        query = "SELECT DISTINCT p.* FROM papers p"
+        if joins:
+            query += " " + " ".join(joins)
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY p.year DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        rows = conn.execute(query, params).fetchall()
         return [self._row_to_paper(row) for row in rows]
 
     async def update_status(self, bibtex_key: str, status: str) -> None:
@@ -390,26 +404,46 @@ class PaperDatabase:
         conn = self._ensure_connection()
         for tag_data in tags:
             conn.execute(
-                "INSERT OR IGNORE INTO tags (tag, description, paper_count) VALUES (?, ?, 0)",
-                (tag_data["tag"], tag_data.get("description")),
+                "INSERT OR IGNORE INTO tags (tag, description, kind, paper_count) VALUES (?, ?, ?, 0)",
+                (
+                    tag_data["tag"],
+                    tag_data.get("description"),
+                    tag_data.get("kind", "concept"),
+                ),
             )
         conn.commit()
 
-    async def list_tags(self, prefix: str | None = None) -> list[Tag]:
-        return await asyncio.to_thread(self._sync_list_tags, prefix)
+    async def list_tags(
+        self, prefix: str | None = None, kind: str | None = None
+    ) -> list[Tag]:
+        return await asyncio.to_thread(self._sync_list_tags, prefix, kind)
 
-    def _sync_list_tags(self, prefix: str | None) -> list[Tag]:
+    def _sync_list_tags(
+        self, prefix: str | None, kind: str | None
+    ) -> list[Tag]:
         conn = self._ensure_connection()
+        clauses: list[str] = []
+        params: list = []
         if prefix:
-            rows = conn.execute(
-                "SELECT * FROM tags WHERE tag LIKE ? ORDER BY paper_count DESC",
-                (f"{prefix}%",),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM tags ORDER BY paper_count DESC"
-            ).fetchall()
-        return [Tag(tag=row["tag"], description=row["description"], paper_count=row["paper_count"]) for row in rows]
+            clauses.append("tag LIKE ?")
+            params.append(f"{prefix}%")
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = conn.execute(
+            f"SELECT * FROM tags{where} ORDER BY paper_count DESC",
+            params,
+        ).fetchall()
+        return [
+            Tag(
+                tag=row["tag"],
+                description=row["description"],
+                kind=row["kind"] if "kind" in row.keys() else "concept",
+                paper_count=row["paper_count"],
+            )
+            for row in rows
+        ]
 
     async def tag_paper(self, bibtex_key: str, tags: list[str]) -> None:
         await asyncio.to_thread(self._sync_tag_paper, bibtex_key, tags)
@@ -492,26 +526,58 @@ class PaperDatabase:
         conn.commit()
 
     async def upsert_tag(
-        self, tag: str, description: str | None = None
+        self,
+        tag: str,
+        description: str | None = None,
+        kind: str | None = None,
     ) -> None:
-        await asyncio.to_thread(self._sync_upsert_tag, tag, description)
+        await asyncio.to_thread(self._sync_upsert_tag, tag, description, kind)
 
-    def _sync_upsert_tag(self, tag: str, description: str | None) -> None:
+    def _sync_upsert_tag(
+        self, tag: str, description: str | None, kind: str | None
+    ) -> None:
         conn = self._ensure_connection()
         row = conn.execute(
-            "SELECT description FROM tags WHERE tag = ?", (tag,)
+            "SELECT description, kind FROM tags WHERE tag = ?", (tag,)
         ).fetchone()
         if row is None:
             conn.execute(
-                "INSERT INTO tags (tag, description, paper_count) VALUES (?, ?, 0)",
-                (tag, description),
+                "INSERT INTO tags (tag, description, kind, paper_count) VALUES (?, ?, ?, 0)",
+                (tag, description, kind or "concept"),
             )
-        elif description is not None and row["description"] != description:
-            conn.execute(
-                "UPDATE tags SET description = ? WHERE tag = ?",
-                (description, tag),
-            )
+        else:
+            updates: list[str] = []
+            params: list = []
+            if description is not None and row["description"] != description:
+                updates.append("description = ?")
+                params.append(description)
+            if kind is not None and row["kind"] != kind:
+                updates.append("kind = ?")
+                params.append(kind)
+            if updates:
+                params.append(tag)
+                conn.execute(
+                    f"UPDATE tags SET {', '.join(updates)} WHERE tag = ?",
+                    params,
+                )
         conn.commit()
+
+    async def set_tag_kind(self, tag: str, kind: str) -> bool:
+        """Flip a tag's kind between 'field' and 'concept'. Returns False
+        if the tag doesn't exist.
+        """
+        return await asyncio.to_thread(self._sync_set_tag_kind, tag, kind)
+
+    def _sync_set_tag_kind(self, tag: str, kind: str) -> bool:
+        conn = self._ensure_connection()
+        row = conn.execute(
+            "SELECT 1 FROM tags WHERE tag = ?", (tag,)
+        ).fetchone()
+        if row is None:
+            return False
+        conn.execute("UPDATE tags SET kind = ? WHERE tag = ?", (kind, tag))
+        conn.commit()
+        return True
 
     async def delete_tags_from_vocab(self, tags: list[str]) -> None:
         """Remove tags from the tags table. paper_tags rows cascade."""

@@ -322,3 +322,127 @@ async def test_prune_empty_tags(db):
     assert removed == ["orphan"]
     remaining = {t.tag for t in await db.list_tags()}
     assert remaining == {"used"}
+
+
+@pytest.mark.asyncio
+async def test_add_tags_defaults_kind_to_concept(db):
+    await db.add_tags([{"tag": "term-structure", "description": None}])
+    tags = await db.list_tags()
+    assert tags[0].kind == "concept"
+
+
+@pytest.mark.asyncio
+async def test_add_tags_preserves_explicit_field_kind(db):
+    await db.add_tags(
+        [{"tag": "finance", "description": None, "kind": "field"}]
+    )
+    tags = await db.list_tags()
+    assert tags[0].kind == "field"
+
+
+@pytest.mark.asyncio
+async def test_list_tags_filters_by_kind(db):
+    await db.add_tags(
+        [
+            {"tag": "finance", "description": None, "kind": "field"},
+            {"tag": "macroeconomics", "description": None, "kind": "field"},
+            {"tag": "term-structure", "description": None, "kind": "concept"},
+        ]
+    )
+    fields = await db.list_tags(kind="field")
+    concepts = await db.list_tags(kind="concept")
+    assert {t.tag for t in fields} == {"finance", "macroeconomics"}
+    assert {t.tag for t in concepts} == {"term-structure"}
+
+
+@pytest.mark.asyncio
+async def test_set_tag_kind_flips_existing(db):
+    await db.add_tags(
+        [{"tag": "industrial-organization", "description": None, "kind": "concept"}]
+    )
+    assert await db.set_tag_kind("industrial-organization", "field") is True
+    tags = await db.list_tags(kind="field")
+    assert any(t.tag == "industrial-organization" for t in tags)
+
+
+@pytest.mark.asyncio
+async def test_set_tag_kind_returns_false_for_missing(db):
+    assert await db.set_tag_kind("nope", "field") is False
+
+
+@pytest.mark.asyncio
+async def test_rebuild_preserves_kind(db):
+    paper = _make_paper(tags=["finance", "term-structure"])
+    await db.rebuild_from_papers(
+        [paper],
+        [
+            {"tag": "finance", "description": None, "kind": "field"},
+            {"tag": "term-structure", "description": None, "kind": "concept"},
+        ],
+    )
+    tags = {t.tag: t.kind for t in await db.list_tags()}
+    assert tags == {"finance": "field", "term-structure": "concept"}
+
+
+@pytest.mark.asyncio
+async def test_list_papers_filter_by_field(db):
+    finance_paper = _make_paper(bibtex_key="smith_2024_fin", tags=["finance", "term-structure"])
+    macro_paper = _make_paper(bibtex_key="doe_2024_mac", tags=["macroeconomics"])
+    await db.rebuild_from_papers(
+        [finance_paper, macro_paper],
+        [
+            {"tag": "finance", "description": None, "kind": "field"},
+            {"tag": "macroeconomics", "description": None, "kind": "field"},
+            {"tag": "term-structure", "description": None, "kind": "concept"},
+        ],
+    )
+    finance_hits = await db.list_papers(field="finance")
+    assert [p.bibtex_key for p in finance_hits] == ["smith_2024_fin"]
+
+
+@pytest.mark.asyncio
+async def test_list_papers_field_and_tag_compose(db):
+    matching = _make_paper(bibtex_key="a_2024_one", tags=["finance", "term-structure"])
+    other_finance = _make_paper(bibtex_key="b_2024_two", tags=["finance", "asset-pricing"])
+    await db.rebuild_from_papers(
+        [matching, other_finance],
+        [
+            {"tag": "finance", "description": None, "kind": "field"},
+            {"tag": "term-structure", "description": None, "kind": "concept"},
+            {"tag": "asset-pricing", "description": None, "kind": "concept"},
+        ],
+    )
+    hits = await db.list_papers(field="finance", tag="term-structure")
+    assert [p.bibtex_key for p in hits] == ["a_2024_one"]
+
+
+@pytest.mark.asyncio
+async def test_list_papers_field_requires_field_kind(db):
+    # a tag with kind=concept named "finance" should NOT match a field filter
+    paper = _make_paper(bibtex_key="x_2024_one", tags=["finance"])
+    await db.rebuild_from_papers(
+        [paper],
+        [{"tag": "finance", "description": None, "kind": "concept"}],
+    )
+    hits = await db.list_papers(field="finance")
+    assert hits == []
+
+
+@pytest.mark.asyncio
+async def test_apply_tag_rewrite_preserves_kind(db):
+    await db.add_tags(
+        [
+            {"tag": "old-field", "description": None, "kind": "field"},
+            {"tag": "new-field", "description": None, "kind": "field"},
+        ]
+    )
+    await _seed_tagged_raw(db, "paper_a", ["old-field"])
+    await db.apply_tag_rewrite({"old-field": "new-field"})
+    tags = {t.tag: t.kind for t in await db.list_tags()}
+    assert tags.get("new-field") == "field"
+
+
+async def _seed_tagged_raw(db, bibtex_key: str, tags: list[str]) -> None:
+    """Like _seed_tagged but doesn't create tags in vocab (they already exist)."""
+    paper = _make_paper(bibtex_key=bibtex_key, tags=tags)
+    await db.upsert_paper(paper)

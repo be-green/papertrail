@@ -211,7 +211,37 @@ class TestVocabularyMutations:
     def test_upsert_adds_new_entry(self, store):
         assert store.upsert_tag_in_vocab("macro", "Macroeconomics") is True
         vocab = store.read_tags()
-        assert vocab == [{"tag": "macro", "description": "Macroeconomics"}]
+        assert vocab == [
+            {"tag": "macro", "description": "Macroeconomics", "kind": "concept"}
+        ]
+
+    def test_upsert_adds_field_entry_when_kind_given(self, store):
+        assert (
+            store.upsert_tag_in_vocab("finance", "Capital markets", kind="field")
+            is True
+        )
+        vocab = store.read_tags()
+        assert vocab[0]["kind"] == "field"
+
+    def test_upsert_does_not_clobber_kind_when_kind_none(self, store):
+        store.write_tags(
+            [{"tag": "finance", "description": "old", "kind": "field"}]
+        )
+        store.upsert_tag_in_vocab("finance", "new")
+        vocab = store.read_tags()
+        assert vocab[0]["kind"] == "field"
+
+    def test_set_tag_kind_in_vocab(self, store):
+        store.write_tags(
+            [{"tag": "industrial-organization", "description": None, "kind": "concept"}]
+        )
+        assert store.set_tag_kind_in_vocab("industrial-organization", "field") is True
+        assert store.read_tags()[0]["kind"] == "field"
+        # second call with same kind is a no-op
+        assert store.set_tag_kind_in_vocab("industrial-organization", "field") is False
+
+    def test_set_tag_kind_returns_false_for_missing(self, store):
+        assert store.set_tag_kind_in_vocab("nope", "field") is False
 
     def test_upsert_updates_description(self, store):
         store.write_tags([{"tag": "macro", "description": "old"}])

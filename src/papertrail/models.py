@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel
 
 
@@ -55,7 +57,14 @@ class PaperMetadata(BaseModel):
 
 
 class Tag(BaseModel):
-    """A tag in the managed vocabulary."""
+    """A tag in the managed vocabulary.
+
+    `kind` distinguishes broad field tags (e.g. `finance`, `macroeconomics`)
+    from concept tags (e.g. `term-structure`, `causal-inference`). Every paper
+    should carry 1-2 field tags and a handful of concepts. Tags without a
+    stored kind default to `concept` for backwards compatibility.
+    """
     tag: str
     description: str | None = None
     paper_count: int = 0
+    kind: Literal["field", "concept"] = "concept"

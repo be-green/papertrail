@@ -148,23 +148,49 @@ class PaperStore:
         return affected
 
     def upsert_tag_in_vocab(
-        self, tag: str, description: str | None = None
+        self,
+        tag: str,
+        description: str | None = None,
+        kind: str | None = None,
     ) -> bool:
-        """Add a tag to tags.json if absent, or update its description if given.
+        """Add a tag to tags.json if absent, or update its fields if given.
 
+        `kind` is only written when explicitly supplied: when upserting an
+        existing entry with `kind=None`, the stored kind is left alone so a
+        generic description update can't accidentally demote a field back to
+        a concept. New entries default to `concept` when kind is None.
         Returns True if tags.json changed.
         """
         vocab = self.read_tags()
         for entry in vocab:
             if entry["tag"] == tag:
+                changed = False
                 if description is not None and entry.get("description") != description:
                     entry["description"] = description
+                    changed = True
+                if kind is not None and entry.get("kind") != kind:
+                    entry["kind"] = kind
+                    changed = True
+                if changed:
                     self.write_tags(vocab)
-                    return True
-                return False
-        vocab.append({"tag": tag, "description": description})
+                return changed
+        new_entry: dict = {"tag": tag, "description": description}
+        new_entry["kind"] = kind or "concept"
+        vocab.append(new_entry)
         self.write_tags(vocab)
         return True
+
+    def set_tag_kind_in_vocab(self, tag: str, kind: str) -> bool:
+        """Flip an existing tag's kind in tags.json. Returns False if absent."""
+        vocab = self.read_tags()
+        for entry in vocab:
+            if entry["tag"] == tag:
+                if entry.get("kind") == kind:
+                    return False
+                entry["kind"] = kind
+                self.write_tags(vocab)
+                return True
+        return False
 
     def remove_tags_from_vocab(self, tags_to_remove: set[str]) -> list[str]:
         """Remove entries from tags.json. Returns the tag names actually removed."""
