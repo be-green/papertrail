@@ -237,3 +237,88 @@ async def test_rebuild_fulltext(db):
     results = await db.search_fulltext("carbon pricing")
     assert len(results) == 1
     assert results[0]["bibtex_key"] == "b_2024_two"
+
+
+async def _seed_tagged(db, bibtex_key: str, tags: list[str]) -> None:
+    """Insert a paper with the given tags and keep the tags table in sync."""
+    paper = _make_paper(bibtex_key=bibtex_key, tags=tags)
+    for name in tags:
+        await db.add_tags([{"tag": name, "description": None}])
+    await db.upsert_paper(paper)
+
+
+@pytest.mark.asyncio
+async def test_remove_paper_tags_recomputes_counts(db):
+    await _seed_tagged(db, "a_2024_one", ["macro", "finance"])
+    await _seed_tagged(db, "b_2024_two", ["macro"])
+
+    await db.remove_paper_tags("a_2024_one", ["macro"])
+
+    counts = {t.tag: t.paper_count for t in await db.list_tags()}
+    assert counts["macro"] == 1
+    assert counts["finance"] == 1
+    assert await db.get_paper_tags("a_2024_one") == ["finance"]
+
+
+@pytest.mark.asyncio
+async def test_apply_tag_rewrite_renames(db):
+    await _seed_tagged(db, "a_2024_one", ["old-tag"])
+    await _seed_tagged(db, "b_2024_two", ["old-tag", "other"])
+
+    await db.apply_tag_rewrite({"old-tag": "new-tag"})
+
+    counts = {t.tag: t.paper_count for t in await db.list_tags()}
+    assert counts.get("new-tag") == 2
+    assert counts.get("old-tag") == 0
+    assert await db.get_paper_tags("a_2024_one") == ["new-tag"]
+    assert set(await db.get_paper_tags("b_2024_two")) == {"new-tag", "other"}
+
+
+@pytest.mark.asyncio
+async def test_apply_tag_rewrite_merges_without_double_counting(db):
+    await _seed_tagged(db, "shared_paper", ["graph-theory", "graph-methods"])
+
+    await db.apply_tag_rewrite({"graph-methods": "graph-theory"})
+
+    tags = await db.get_paper_tags("shared_paper")
+    assert tags == ["graph-theory"]
+    counts = {t.tag: t.paper_count for t in await db.list_tags()}
+    assert counts["graph-theory"] == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_tag_rewrite_strips_when_target_is_none(db):
+    await _seed_tagged(db, "a_2024_one", ["macro", "finance"])
+    await db.apply_tag_rewrite({"finance": None})
+    assert await db.get_paper_tags("a_2024_one") == ["macro"]
+    counts = {t.tag: t.paper_count for t in await db.list_tags()}
+    assert counts.get("finance", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_tags_from_vocab(db):
+    await db.add_tags([{"tag": "macro", "description": None}])
+    await db.delete_tags_from_vocab(["macro"])
+    assert all(t.tag != "macro" for t in await db.list_tags())
+
+
+@pytest.mark.asyncio
+async def test_upsert_tag_inserts_and_updates(db):
+    await db.upsert_tag("macro", "Macroeconomics")
+    tags = await db.list_tags()
+    assert any(t.tag == "macro" and t.description == "Macroeconomics" for t in tags)
+
+    await db.upsert_tag("macro", "Updated")
+    tags = await db.list_tags()
+    assert any(t.tag == "macro" and t.description == "Updated" for t in tags)
+
+
+@pytest.mark.asyncio
+async def test_prune_empty_tags(db):
+    await _seed_tagged(db, "a_2024_one", ["used"])
+    await db.add_tags([{"tag": "orphan", "description": None}])
+
+    removed = await db.prune_empty_tags()
+    assert removed == ["orphan"]
+    remaining = {t.tag for t in await db.list_tags()}
+    assert remaining == {"used"}

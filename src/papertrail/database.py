@@ -429,6 +429,115 @@ class PaperDatabase:
             )
         conn.commit()
 
+    async def remove_paper_tags(
+        self, bibtex_key: str, tags: list[str]
+    ) -> None:
+        await asyncio.to_thread(self._sync_remove_paper_tags, bibtex_key, tags)
+
+    def _sync_remove_paper_tags(
+        self, bibtex_key: str, tags: list[str]
+    ) -> None:
+        conn = self._ensure_connection()
+        for tag in tags:
+            conn.execute(
+                "DELETE FROM paper_tags WHERE bibtex_key = ? AND tag = ?",
+                (bibtex_key, tag),
+            )
+            conn.execute(
+                """UPDATE tags SET paper_count = (
+                    SELECT COUNT(*) FROM paper_tags WHERE tag = ?
+                ) WHERE tag = ?""",
+                (tag, tag),
+            )
+        conn.commit()
+
+    async def apply_tag_rewrite(self, mapping: dict[str, str | None]) -> None:
+        """Rename, merge, or strip tags across the paper_tags index.
+
+        For each (old, new) pair: if `new` is None, remove all paper_tags rows
+        for `old`. Otherwise move rows from `old` to `new`, deduplicating when a
+        paper already carries `new`. Target tags are auto-inserted into the
+        tags table if missing (with NULL description — caller is expected to
+        upsert descriptions separately). Paper counts are recomputed for every
+        tag touched.
+        """
+        await asyncio.to_thread(self._sync_apply_tag_rewrite, mapping)
+
+    def _sync_apply_tag_rewrite(self, mapping: dict[str, str | None]) -> None:
+        if not mapping:
+            return
+        conn = self._ensure_connection()
+        for old, new in mapping.items():
+            if new is None:
+                conn.execute("DELETE FROM paper_tags WHERE tag = ?", (old,))
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO tags (tag, description, paper_count) VALUES (?, NULL, 0)",
+                (new,),
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO paper_tags (bibtex_key, tag)
+                   SELECT bibtex_key, ? FROM paper_tags WHERE tag = ?""",
+                (new, old),
+            )
+            conn.execute("DELETE FROM paper_tags WHERE tag = ?", (old,))
+        touched = {t for pair in mapping.items() for t in pair if t}
+        for tag in touched:
+            conn.execute(
+                """UPDATE tags SET paper_count = (
+                    SELECT COUNT(*) FROM paper_tags WHERE tag = ?
+                ) WHERE tag = ?""",
+                (tag, tag),
+            )
+        conn.commit()
+
+    async def upsert_tag(
+        self, tag: str, description: str | None = None
+    ) -> None:
+        await asyncio.to_thread(self._sync_upsert_tag, tag, description)
+
+    def _sync_upsert_tag(self, tag: str, description: str | None) -> None:
+        conn = self._ensure_connection()
+        row = conn.execute(
+            "SELECT description FROM tags WHERE tag = ?", (tag,)
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO tags (tag, description, paper_count) VALUES (?, ?, 0)",
+                (tag, description),
+            )
+        elif description is not None and row["description"] != description:
+            conn.execute(
+                "UPDATE tags SET description = ? WHERE tag = ?",
+                (description, tag),
+            )
+        conn.commit()
+
+    async def delete_tags_from_vocab(self, tags: list[str]) -> None:
+        """Remove tags from the tags table. paper_tags rows cascade."""
+        await asyncio.to_thread(self._sync_delete_tags_from_vocab, tags)
+
+    def _sync_delete_tags_from_vocab(self, tags: list[str]) -> None:
+        conn = self._ensure_connection()
+        for tag in tags:
+            conn.execute("DELETE FROM tags WHERE tag = ?", (tag,))
+        conn.commit()
+
+    async def prune_empty_tags(self) -> list[str]:
+        """Drop tags with zero papers. Returns the removed tag names."""
+        return await asyncio.to_thread(self._sync_prune_empty_tags)
+
+    def _sync_prune_empty_tags(self) -> list[str]:
+        conn = self._ensure_connection()
+        rows = conn.execute(
+            "SELECT tag FROM tags WHERE paper_count = 0"
+        ).fetchall()
+        removed = [row["tag"] for row in rows]
+        for tag in removed:
+            conn.execute("DELETE FROM tags WHERE tag = ?", (tag,))
+        conn.commit()
+        return removed
+
     async def get_paper_tags(self, bibtex_key: str) -> list[str]:
         return await asyncio.to_thread(self._sync_get_paper_tags, bibtex_key)
 

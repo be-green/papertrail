@@ -16,6 +16,7 @@ from papertrail.metadata import MetadataFetcher
 from papertrail.models import PaperMetadata, SearchResult
 from papertrail.sync import sync_pull, sync_pull_if_stale, sync_push, sync_delete
 from papertrail.paper_store import PaperStore
+from papertrail.tag_similarity import similar_tags
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,14 @@ async def _push_paper(lc: dict, bibtex_key: str) -> None:
 async def _push_tags(lc: dict) -> None:
     """Push tags.json to the remote after a local write."""
     await sync_push(lc["remote"], lc["config"].data_dir, "tags.json")
+
+
+async def _push_all_papers(lc: dict) -> None:
+    """Push the entire papers/ tree. rclone copy is additive and skips files
+    whose size+mtime match the remote, so this is cheap even when only a
+    handful of metadata.json files changed during a bulk tag rewrite.
+    """
+    await sync_push(lc["remote"], lc["config"].data_dir, "papers")
 
 
 async def _start_conversion(lc: dict, bibtex_key: str, pdf_path: Path) -> None:
@@ -827,6 +836,12 @@ async def list_tags(prefix: str | None = None, ctx: Context = None) -> str:
 async def add_tags(tags: str, ctx: Context = None) -> str:
     """Add new tags to the vocabulary.
 
+    Prefer reusing existing tags over minting new ones. Call `find_similar_tags`
+    on candidate new names first. This tool will still create near-duplicate
+    tags (e.g. "graph-methods" alongside "graph-theory") but returns a warning
+    listing the similar existing tags so you can reconsider before tagging a
+    paper with the new one.
+
     Args:
         tags: JSON array of objects with 'tag' (required) and 'description' (optional).
               Example: [{"tag": "causal-inference", "description": "Papers using causal methods"}]
@@ -843,21 +858,100 @@ async def add_tags(tags: str, ctx: Context = None) -> str:
     if not isinstance(tag_list, list):
         return "Expected a JSON array of tag objects."
 
-    # Update source of truth: merge into tags.json
     existing_tags = await asyncio.to_thread(store.read_tags)
     existing_tag_names = {t["tag"] for t in existing_tags}
+
+    added: list[str] = []
+    skipped_duplicates: list[str] = []
+    warnings: list[str] = []
+    vocabulary_names = list(existing_tag_names)
+    tag_counts = {t.tag: t.paper_count for t in await db.list_tags()}
+
     for new_tag in tag_list:
-        if new_tag["tag"] not in existing_tag_names:
-            existing_tags.append(new_tag)
-            existing_tag_names.add(new_tag["tag"])
-    await asyncio.to_thread(store.write_tags, existing_tags)
+        name = new_tag["tag"]
+        if name in existing_tag_names:
+            skipped_duplicates.append(name)
+            continue
+        existing_tags.append(new_tag)
+        existing_tag_names.add(name)
+        added.append(name)
+        matches = similar_tags(name, vocabulary_names)
+        if matches:
+            rendered = ", ".join(
+                f"{m} ({tag_counts.get(m, 0)})" for m in matches[:5]
+            )
+            warnings.append(f"- **{name}** is close to: {rendered}")
 
-    # Update index
-    await db.add_tags(tag_list)
-    await _push_tags(lc)
+    if added:
+        await asyncio.to_thread(store.write_tags, existing_tags)
+        await db.add_tags([t for t in tag_list if t["tag"] in added])
+        await _push_tags(lc)
 
-    tag_names = [t["tag"] for t in tag_list]
-    return f"Added tags: {', '.join(tag_names)}"
+    lines: list[str] = []
+    if added:
+        lines.append(f"Added tags: {', '.join(added)}")
+    if skipped_duplicates:
+        lines.append(f"Already in vocabulary: {', '.join(skipped_duplicates)}")
+    if warnings:
+        lines.append(
+            "\nWarning: some new tags look similar to existing ones. "
+            "Consider reusing the existing tag before calling tag_paper."
+        )
+        lines.extend(warnings)
+    if not lines:
+        lines.append("No tags provided.")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def find_similar_tags(
+    candidates: str, max_edit_distance: int = 3, ctx: Context = None
+) -> str:
+    """Check a list of candidate tag names against the existing vocabulary.
+
+    Use this before calling `add_tags` to see whether a proposed new tag would
+    duplicate something already present. Flags entries that share a
+    non-stopword kebab-case token with the candidate, or that are within the
+    given Levenshtein distance. Paper counts are included so you can prefer
+    well-established tags.
+
+    Args:
+        candidates: JSON array of candidate tag names, e.g. ["graph-methods", "bayes"]
+        max_edit_distance: Maximum Levenshtein distance to flag as similar (default 3)
+    """
+    lc = _get_context(ctx)
+    await _ensure_synced(lc)
+    db: PaperDatabase = lc["db"]
+
+    try:
+        name_list = json.loads(candidates) if isinstance(candidates, str) else candidates
+    except json.JSONDecodeError as exc:
+        return f"Invalid JSON: {exc}"
+
+    if not isinstance(name_list, list) or not all(isinstance(n, str) for n in name_list):
+        return "Expected a JSON array of candidate tag name strings."
+
+    vocab = await db.list_tags()
+    vocab_names = [t.tag for t in vocab]
+    counts = {t.tag: t.paper_count for t in vocab}
+
+    lines: list[str] = []
+    for candidate in name_list:
+        if candidate in counts:
+            lines.append(
+                f"**{candidate}** — exact match in vocabulary "
+                f"({counts[candidate]} papers). Reuse it."
+            )
+            continue
+        matches = similar_tags(
+            candidate, vocab_names, max_edit_distance=max_edit_distance
+        )
+        if not matches:
+            lines.append(f"**{candidate}** — no close matches; safe to add.")
+            continue
+        rendered = ", ".join(f"{m} ({counts.get(m, 0)})" for m in matches[:6])
+        lines.append(f"**{candidate}** — similar to: {rendered}")
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -905,6 +999,250 @@ async def tag_paper(bibtex_key: str, tags: str, ctx: Context = None) -> str:
     await _push_paper(lc, bibtex_key)
 
     return f"Tagged **{bibtex_key}** with: {', '.join(tag_list)}"
+
+
+@mcp.tool()
+async def untag_paper(bibtex_key: str, tags: str, ctx: Context = None) -> str:
+    """Remove one or more tags from a single paper.
+
+    Leaves the tags intact in the vocabulary and on other papers — use
+    `delete_tag`, `rename_tag`, or `merge_tags` for vocabulary-wide changes.
+
+    Args:
+        bibtex_key: The paper's BibTeX key
+        tags: JSON array of tag names to remove, e.g. ["macro", "finance"]
+    """
+    lc = _get_context(ctx)
+    await _ensure_synced(lc)
+    db: PaperDatabase = lc["db"]
+    store: PaperStore = lc["store"]
+
+    try:
+        tag_list = json.loads(tags) if isinstance(tags, str) else tags
+    except json.JSONDecodeError as exc:
+        return f"Invalid JSON: {exc}"
+
+    if not isinstance(tag_list, list) or not all(isinstance(t, str) for t in tag_list):
+        return "Expected a JSON array of tag names."
+
+    paper = await asyncio.to_thread(store.read_paper_metadata, bibtex_key)
+    if paper is None:
+        return f"No paper found with key: {bibtex_key}"
+
+    changed = await asyncio.to_thread(
+        store.remove_tags_from_paper, bibtex_key, set(tag_list)
+    )
+    if not changed:
+        return f"**{bibtex_key}** already had none of: {', '.join(tag_list)}"
+
+    await db.remove_paper_tags(bibtex_key, tag_list)
+    await _push_paper(lc, bibtex_key)
+    return f"Removed {', '.join(tag_list)} from **{bibtex_key}**."
+
+
+@mcp.tool()
+async def rename_tag(
+    old: str,
+    new: str,
+    description: str | None = None,
+    ctx: Context = None,
+) -> str:
+    """Rename a tag across the vocabulary and every paper that uses it.
+
+    If `new` doesn't exist yet it is created (inheriting `old`'s description
+    unless an override is provided). If `new` already exists the rename
+    degenerates into a merge of `old` into `new`, and the supplied description
+    (if any) replaces the existing one.
+
+    Args:
+        old: Current tag name
+        new: Desired tag name
+        description: Optional description for the (possibly new) tag
+    """
+    if old == new:
+        return "Old and new tag names are identical; nothing to do."
+
+    lc = _get_context(ctx)
+    await _ensure_synced(lc)
+    db: PaperDatabase = lc["db"]
+    store: PaperStore = lc["store"]
+
+    vocab = await asyncio.to_thread(store.read_tags)
+    old_entry = next((t for t in vocab if t["tag"] == old), None)
+    if old_entry is None:
+        return f"Tag '{old}' is not in the vocabulary."
+
+    resolved_description = description
+    if resolved_description is None:
+        resolved_description = old_entry.get("description")
+
+    await asyncio.to_thread(
+        store.upsert_tag_in_vocab, new, resolved_description
+    )
+    await db.upsert_tag(new, resolved_description)
+
+    affected = await asyncio.to_thread(store.apply_tag_rewrite, {old: new})
+    await db.apply_tag_rewrite({old: new})
+
+    await asyncio.to_thread(store.remove_tags_from_vocab, {old})
+    await db.delete_tags_from_vocab([old])
+
+    await _push_tags(lc)
+    if affected:
+        await _push_all_papers(lc)
+
+    return (
+        f"Renamed '{old}' -> '{new}' across {len(affected)} paper(s)."
+        if affected
+        else f"Renamed '{old}' -> '{new}' (no papers used the old tag)."
+    )
+
+
+@mcp.tool()
+async def merge_tags(
+    sources: str,
+    target: str,
+    description: str | None = None,
+    ctx: Context = None,
+) -> str:
+    """Fold one or more source tags into a single target tag.
+
+    Every paper tagged with any source tag gets `target` instead; the source
+    tags are then removed from the vocabulary. If `target` doesn't already
+    exist, it is created (with the given description, or left empty).
+
+    Args:
+        sources: JSON array of tag names to merge away, e.g. ["graph-theory", "graph-methods"]
+        target: The tag to keep. Papers from all sources end up with this tag.
+        description: Optional description for the target tag (only used if the tag is new)
+    """
+    lc = _get_context(ctx)
+    await _ensure_synced(lc)
+    db: PaperDatabase = lc["db"]
+    store: PaperStore = lc["store"]
+
+    try:
+        source_list = json.loads(sources) if isinstance(sources, str) else sources
+    except json.JSONDecodeError as exc:
+        return f"Invalid JSON: {exc}"
+
+    if not isinstance(source_list, list) or not all(
+        isinstance(s, str) for s in source_list
+    ):
+        return "Expected a JSON array of source tag names."
+    if not source_list:
+        return "No source tags provided."
+    if target in source_list:
+        return f"Target '{target}' cannot also be a source."
+
+    vocab = await asyncio.to_thread(store.read_tags)
+    vocab_names = {t["tag"] for t in vocab}
+    real_sources = [s for s in source_list if s in vocab_names]
+    unknown = [s for s in source_list if s not in vocab_names]
+    if not real_sources:
+        return f"None of those sources exist in the vocabulary: {', '.join(source_list)}"
+
+    await asyncio.to_thread(store.upsert_tag_in_vocab, target, description)
+    await db.upsert_tag(target, description)
+
+    mapping = {src: target for src in real_sources}
+    affected = await asyncio.to_thread(store.apply_tag_rewrite, mapping)
+    await db.apply_tag_rewrite(mapping)
+
+    await asyncio.to_thread(store.remove_tags_from_vocab, set(real_sources))
+    await db.delete_tags_from_vocab(real_sources)
+
+    await _push_tags(lc)
+    if affected:
+        await _push_all_papers(lc)
+
+    lines = [
+        f"Merged {', '.join(real_sources)} -> '{target}' "
+        f"across {len(affected)} paper(s)."
+    ]
+    if unknown:
+        lines.append(f"Ignored (not in vocabulary): {', '.join(unknown)}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def delete_tag(
+    tag: str, force: bool = False, ctx: Context = None
+) -> str:
+    """Remove a tag from the vocabulary.
+
+    By default, refuses to delete a tag that's still applied to papers —
+    run `merge_tags` into a better tag, or call with `force=True` to strip
+    the tag from every paper before removing it.
+
+    Args:
+        tag: Tag name to delete
+        force: If True, strip the tag from all papers first. Default False.
+    """
+    lc = _get_context(ctx)
+    await _ensure_synced(lc)
+    db: PaperDatabase = lc["db"]
+    store: PaperStore = lc["store"]
+
+    vocab = await asyncio.to_thread(store.read_tags)
+    if not any(t["tag"] == tag for t in vocab):
+        return f"Tag '{tag}' is not in the vocabulary."
+
+    tag_entries = await db.list_tags()
+    paper_count = next((t.paper_count for t in tag_entries if t.tag == tag), 0)
+
+    if paper_count > 0 and not force:
+        return (
+            f"Tag '{tag}' is still applied to {paper_count} paper(s). "
+            f"Use merge_tags to fold it into another tag, or call "
+            f"delete_tag again with force=True to strip it from every paper."
+        )
+
+    affected: list[str] = []
+    if paper_count > 0:
+        affected = await asyncio.to_thread(store.apply_tag_rewrite, {tag: None})
+        await db.apply_tag_rewrite({tag: None})
+
+    await asyncio.to_thread(store.remove_tags_from_vocab, {tag})
+    await db.delete_tags_from_vocab([tag])
+
+    await _push_tags(lc)
+    if affected:
+        await _push_all_papers(lc)
+
+    suffix = f" (stripped from {len(affected)} paper(s))" if affected else ""
+    return f"Deleted tag '{tag}'{suffix}."
+
+
+@mcp.tool()
+async def prune_tags(dry_run: bool = True, ctx: Context = None) -> str:
+    """Remove tags from the vocabulary that have zero papers.
+
+    Args:
+        dry_run: If True (default), only report what would be pruned.
+                 Set to False to actually remove them.
+    """
+    lc = _get_context(ctx)
+    await _ensure_synced(lc)
+    db: PaperDatabase = lc["db"]
+    store: PaperStore = lc["store"]
+
+    tag_entries = await db.list_tags()
+    orphans = [t.tag for t in tag_entries if t.paper_count == 0]
+    if not orphans:
+        return "No orphan tags to prune."
+
+    if dry_run:
+        return (
+            f"Would prune {len(orphans)} orphan tag(s): "
+            f"{', '.join(orphans)}\n\n"
+            "Call again with dry_run=False to remove them."
+        )
+
+    await asyncio.to_thread(store.remove_tags_from_vocab, set(orphans))
+    await db.delete_tags_from_vocab(orphans)
+    await _push_tags(lc)
+    return f"Pruned {len(orphans)} orphan tag(s): {', '.join(orphans)}"
 
 
 # ---------------------------------------------------------------------------

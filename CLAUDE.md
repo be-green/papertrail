@@ -23,6 +23,12 @@ Papertrail is an MCP server (FastMCP) for managing an academic paper library. It
 
 **Sync staleness.** `_ensure_synced` in `server.py` re-pulls from remote if >5 min since last pull, so long-lived sessions pick up changes made on other machines.
 
+**Ingestion pipeline.** Metadata and PDF acquisition are separate tools so skills can parallelize them:
+1. `ingest_paper` (or `ingest_paper_manual` for unindexed drafts) — fetches metadata, saves the paper record, optionally kicks off auto-download in the background.
+2. `download_paper` — explicit PDF acquisition (`pdf_url=` or `pdf_source_path=`); used when `auto_download=False` or automated discovery failed.
+3. `conversion_status` — polled until status reaches `summarizing`; pymupdf4llm conversion runs in a background task.
+4. `store_summary` — persists the model-generated summary once conversion is done.
+
 ## Key modules (src/papertrail/)
 - `server.py` — MCP tool definitions + lifespan
 - `paper_store.py` — synchronous JSON I/O; call via `asyncio.to_thread` for bulk ops

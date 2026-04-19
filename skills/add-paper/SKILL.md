@@ -178,16 +178,50 @@ If the subagent returned `WRONG_DOCUMENT`, report the issue to the user:
 - The bibtex key so they can delete it or provide the correct PDF
 - Stop here. Do not store a summary or assign tags.
 
-## Step 6: Assign tags and store summary (in parallel)
+## Step 6: Assign tags and store summary
 
 Once the subagent returns the summary and keywords, and you have the tag vocabulary:
 
-1. Choose relevant existing tags for this paper based on the summary
-2. If the paper covers topics not in the vocabulary, call `add_tags` with new tags
-   (include a short description for each new tag)
-3. Then call **both of these in parallel**:
-   - `tag_paper` with the bibtex key and chosen tags
-   - `store_summary` with the bibtex key, the JSON summary string, and the keywords list
+### 6a. Prefer existing tags
+
+Read the vocabulary carefully. For each topic the paper covers, pick the best
+existing tag rather than minting a new one. The vocabulary is sorted by paper
+count — high-count tags are well-established and should be reused whenever
+they're a reasonable fit.
+
+Rules of thumb:
+- If an existing tag with **≥3 papers** plausibly covers a topic, use it. Do
+  not invent a finer-grained alternative.
+- Cap new tags at **1 per paper** unless the paper genuinely opens a new area
+  that no existing tag can cover. In that case, still aim for a single,
+  broader new tag rather than several narrow ones.
+- Prefer generic names over paper-specific ones. "term-structure" beats
+  "affine-term-structure-with-quadratic-drift".
+
+### 6b. Check candidate new tags for near-duplicates
+
+If — after applying the rules above — you still intend to create any new
+tags, call `find_similar_tags` with the full JSON array of candidate names
+**before** calling `add_tags`. The result lists existing tags that share
+tokens or are close edit-distance matches, with their paper counts.
+
+For each candidate with similar existing tags:
+- If any existing match is a reasonable fit, drop the candidate and use the
+  existing tag instead.
+- Only keep the candidate if you can explain why none of the listed existing
+  tags cover what it describes.
+
+### 6c. Add surviving new tags, then tag and summarise
+
+1. If any new tags survived Step 6b, call `add_tags` with them (include a
+   short description for each). If the response contains a "Warning" block
+   about similar tags, treat it as a last-chance prompt: switch to the listed
+   existing tag unless you have a clear reason not to.
+2. Then call **both of these in parallel**:
+   - `tag_paper` with the bibtex key and the final chosen tags (existing + any
+     new ones you decided to keep)
+   - `store_summary` with the bibtex key, the JSON summary string, and the
+     keywords list
 
 ## Step 7: Report
 
